@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Local backups (do not commit user data)
+backups_state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
