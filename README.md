@@ -37,6 +37,9 @@ This tool syncs the provider tag of your conversations to the target provider, i
 **先彻底关闭 Codex**（含后台进程），否则数据库被锁可能写失败。
 
 ```bash
+# Enter the folder where the files are / 先进入文件所在的文件夹
+cd "path/to/this/folder"
+
 # Show current status (read-only) / 查看现状（只读）
 python codex_provider_sync.py --status
 
