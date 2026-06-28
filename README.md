@@ -44,7 +44,6 @@ codex_provider_local_launcher.py      # Main Python tool / Python 主程序
 同步恢复对话.bat                        # Windows launcher / Windows 启动脚本
 Linux/同步恢复对话.sh                   # Linux launcher / Linux 启动脚本
 Macos/同步恢复对话.command              # macOS launcher / macOS 启动脚本
-github/                               # Upstream reference code / 上游参考代码
 ```
 
 The current version uses the Python launcher only.
