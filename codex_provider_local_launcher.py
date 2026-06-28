@@ -879,8 +879,8 @@ def run_restore_flow(codex_home: Path) -> None:
         print(f"恢复选项不可用：{conversation_backup_root(codex_home)} 下没有包含 sessions/ 的备份。")
         return
 
-    delete_answer = input("是否删除所有对话文件备份？是请输入 YES，不是任意键：")
-    if delete_answer.strip() == "YES":
+    delete_answer = input("是否删除所有对话文件备份？是请输入Y；不是则请输入任意键：")
+    if delete_answer.strip().upper() == "Y":
         result = delete_conversation_backups(codex_home)
         print(f"已删除 {result['deleted']} 个对话文件备份：{result['root']}")
 
