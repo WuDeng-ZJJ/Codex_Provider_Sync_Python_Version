@@ -3,20 +3,22 @@ chcp 65001 >nul
 cd /d "%~dp0"
 setlocal
 
-set "TOOL_DIR=%~dp0github"
-set "CLI=%~dp0codex_provider_local_launcher.mjs"
+set "CLI=%~dp0codex_provider_local_launcher.py"
 set "CODEX_HOME=%USERPROFILE%\.codex"
-set "NODE_NO_WARNINGS=1"
-set "NODE_EXE="
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+set "PYTHON_EXE="
+set "PYTHON_ARGS="
 
-for /d %%D in ("%LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node\*") do (
-    if exist "%%~fD\bin\node.exe" set "NODE_EXE=%%~fD\bin\node.exe"
+for /f "delims=" %%P in ('where python 2^>nul') do (
+    if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
 )
 
-if not defined NODE_EXE (
-    for /f "delims=" %%N in ('where node 2^>nul') do (
-        if not defined NODE_EXE set "NODE_EXE=%%N"
+if not defined PYTHON_EXE (
+    for /f "delims=" %%P in ('where py 2^>nul') do (
+        if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
     )
+    if defined PYTHON_EXE set "PYTHON_ARGS=-3"
 )
 
 echo ============================================
@@ -25,30 +27,22 @@ echo ============================================
 echo.
 
 if not exist "%CLI%" (
-    echo [ERROR] Missing local launcher:
+    echo [ERROR] Missing Python launcher:
     echo   "%CLI%"
     echo.
     pause
     exit /b 1
 )
 
-if not exist "%TOOL_DIR%\src\service.js" (
-    echo [ERROR] Missing GitHub tool code:
-    echo   "%TOOL_DIR%\src\service.js"
+if not defined PYTHON_EXE (
+    echo [ERROR] Missing Python.
+    echo This launcher checks system PATH for python or py.
     echo.
     pause
     exit /b 1
 )
 
-if not defined NODE_EXE (
-    echo [ERROR] Missing Node.js.
-    echo This launcher checks Codex bundled Node first, then system PATH.
-    echo.
-    pause
-    exit /b 1
-)
-
-"%NODE_EXE%" "%CLI%" interactive "%CODEX_HOME%"
+"%PYTHON_EXE%" %PYTHON_ARGS% "%CLI%" interactive "%CODEX_HOME%"
 if errorlevel 1 (
     echo.
     echo [ERROR] Operation failed. Check the message above.
