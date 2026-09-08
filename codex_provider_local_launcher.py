@@ -13,6 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10: use the compatible backport when available.
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
 
 DEFAULT_PROVIDER = "openai"
 SESSION_DIRS = ("sessions", "archived_sessions")
@@ -21,6 +29,7 @@ SQLITE_DIR_BASENAME = "sqlite"
 PROVIDER_BACKUP_NAMESPACE = "provider-sync"
 CONVERSATION_BACKUP_NAMESPACE = "py-provider-sync"
 DB_CLEANUP_BACKUP_NAMESPACE = "manual-db-cleanup"
+PROVIDER_CONFIG_RECOVERY_NAMESPACE = "provider-config-recovery"
 
 
 def default_codex_home() -> Path:
@@ -41,6 +50,10 @@ def conversation_backup_root(codex_home: Path) -> Path:
 
 def database_cleanup_backup_root(codex_home: Path) -> Path:
     return codex_home / "backups_state" / DB_CLEANUP_BACKUP_NAMESPACE
+
+
+def provider_config_recovery_root(codex_home: Path) -> Path:
+    return codex_home / "backups_state" / PROVIDER_CONFIG_RECOVERY_NAMESPACE
 
 
 def timestamp_for_path() -> str:
@@ -154,16 +167,213 @@ def read_current_provider_from_config_text(config_text: str) -> tuple[str, bool]
             continue
         if trimmed.startswith("["):
             break
-        match = re.match(r'^model_provider\s*=\s*"([^"]+)"\s*$', trimmed)
+        match = re.match(r'''^model_provider\s*=\s*(["'])([^"']+)\1\s*$''', trimmed)
         if match:
-            return match.group(1), False
+            return match.group(2), False
     return DEFAULT_PROVIDER, True
 
 
 def list_configured_provider_ids(config_text: str) -> list[str]:
     providers = {DEFAULT_PROVIDER}
+    if tomllib is not None:
+        try:
+            config = tomllib.loads(config_text)
+            configured = config.get("model_providers")
+            if isinstance(configured, dict):
+                providers.update(str(provider) for provider in configured)
+            return sorted(providers)
+        except (tomllib.TOMLDecodeError, ValueError):
+            pass
     providers.update(re.findall(r"^\[model_providers\.([A-Za-z0-9_.-]+)]\s*$", config_text, flags=re.M))
     return sorted(providers)
+
+
+def provider_config_error(config_text: str) -> str | None:
+    if tomllib is None:
+        current_provider, _ = read_current_provider_from_config_text(config_text)
+        if current_provider == DEFAULT_PROVIDER:
+            return None
+        section_pattern = rf"^\[model_providers\.{re.escape(current_provider)}\]\s*$"
+        if re.search(section_pattern, config_text, flags=re.M):
+            return None
+        return (
+            "当前 Python 缺少 TOML 解析器，且 config.toml 没有找到当前 provider。"
+            "请使用 Python 3.11+，或安装 tomli 后重新运行。"
+        )
+    try:
+        config = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError as error:
+        return f"config.toml 不是有效的 TOML：{error}"
+
+    current_provider = config.get("model_provider", DEFAULT_PROVIDER)
+    if not isinstance(current_provider, str) or not current_provider.strip():
+        return "config.toml 的 model_provider 不是有效的字符串"
+    if current_provider == DEFAULT_PROVIDER:
+        return None
+
+    providers = config.get("model_providers")
+    if isinstance(providers, dict) and isinstance(providers.get(current_provider), dict):
+        return None
+    return (
+        f"config.toml 当前使用的 model provider '{current_provider}' 没有对应的 "
+        f"[model_providers.{current_provider}] 配置。"
+    )
+
+
+def validate_provider_config(config_text: str) -> tuple[str, bool]:
+    error = provider_config_error(config_text)
+    if error:
+        raise RuntimeError(
+            f"{error} 已停止写入，避免恢复后出现 Model provider not found。"
+            "请先补全 config.toml，或改为已配置的 provider 后重新运行。"
+        )
+    return read_current_provider_from_config_text(config_text)
+
+
+def load_operation_provider_config(codex_home: Path) -> tuple[str, str, bool]:
+    recovery = recover_provider_config(codex_home)
+    config_text = read_config_text(codex_home)
+    current_provider, _ = validate_provider_config(config_text)
+    if recovery["recovered"]:
+        print(
+            "已从历史同步备份恢复缺失的 provider 配置："
+            f"{recovery['source']}"
+        )
+    return config_text, current_provider, bool(recovery["recovered"])
+
+
+def validate_config_snapshot(
+    codex_home: Path,
+    expected_text: str,
+    expected_provider: str,
+) -> None:
+    current_text = read_config_text(codex_home)
+    current_provider, _ = validate_provider_config(current_text)
+    if current_text != expected_text or current_provider != expected_provider:
+        raise RuntimeError(
+            "config.toml 在维护过程中发生变化，已停止写入，请确认配置完整后重新运行。"
+        )
+
+
+def extract_provider_table(config_text: str, provider: str) -> str | None:
+    header_pattern = re.compile(
+        rf"^\[model_providers\.{re.escape(provider)}\]\s*(?:#.*)?$",
+        flags=re.M,
+    )
+    match = header_pattern.search(config_text)
+    if not match:
+        return None
+
+    start = match.start()
+    next_table = re.search(r"^\[[^\r\n]+\]\s*(?:#.*)?$", config_text[match.end():], flags=re.M)
+    end = match.end() + next_table.start() if next_table else len(config_text)
+    return config_text[start:end].strip()
+
+
+def merge_provider_config(current_text: str, source_text: str, provider: str) -> tuple[str, str]:
+    provider_table = extract_provider_table(source_text, provider)
+    if not provider_table:
+        raise RuntimeError(f"历史配置中缺少 [model_providers.{provider}] 配置。")
+
+    merged_text = f"{current_text.rstrip()}\n\n{provider_table}\n"
+    if provider_config_error(merged_text) is not None:
+        raise RuntimeError("历史 provider 配置无法合并到当前 config.toml。")
+    return merged_text, "provider-table"
+
+
+def recover_provider_config(codex_home: Path) -> dict[str, Any]:
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        raise RuntimeError(f"找不到 config.toml：{config_path}")
+
+    current_text = config_path.read_text(encoding="utf-8")
+    error = provider_config_error(current_text)
+    if error is None:
+        current_provider, _ = read_current_provider_from_config_text(current_text)
+        return {"recovered": False, "provider": current_provider, "source": None}
+
+    current_provider, _ = read_current_provider_from_config_text(current_text)
+    backup_root = provider_backup_root(codex_home)
+    candidates = sorted(
+        backup_root.rglob("config.toml") if backup_root.exists() else [],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    source_path = None
+    source_text = None
+    for candidate in candidates:
+        try:
+            candidate_text = candidate.read_text(encoding="utf-8")
+            candidate_provider, _ = read_current_provider_from_config_text(candidate_text)
+        except (OSError, UnicodeError):
+            continue
+        if candidate_provider == current_provider and provider_config_error(candidate_text) is None:
+            source_path = candidate
+            source_text = candidate_text
+            break
+
+    if source_path is None or source_text is None:
+        raise RuntimeError(
+            f"{error} 未找到同名且完整的历史配置备份，已停止操作，未修改 config.toml。"
+        )
+
+    recovery_dir = unique_timestamp_dir(provider_config_recovery_root(codex_home))
+    recovery_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(config_path, recovery_dir / "config.toml.before")
+    shutil.copy2(source_path, recovery_dir / "config.toml.source")
+    (recovery_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "provider": current_provider,
+                "source": str(source_path),
+                "mode": "pending",
+                "recoveredAt": datetime.now(tz=timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    replacement_text = source_text
+    recovery_mode = "full-config"
+    try:
+        replacement_text, recovery_mode = merge_provider_config(
+            current_text,
+            source_text,
+            current_provider,
+        )
+    except (RuntimeError, ValueError):
+        # A malformed current TOML cannot be merged reliably, so use the validated source backup.
+        pass
+
+    manifest_path = recovery_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mode"] = recovery_mode
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    temporary_path = config_path.with_name(f"{config_path.name}.recovery.{os.getpid()}.tmp")
+    try:
+        temporary_path.write_text(replacement_text, encoding="utf-8")
+        os.replace(temporary_path, config_path)
+        validate_provider_config(read_config_text(codex_home))
+    except Exception:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+        restore_path = config_path.with_name(f"{config_path.name}.restore.{os.getpid()}.tmp")
+        restore_path.write_text(current_text, encoding="utf-8")
+        os.replace(restore_path, config_path)
+        raise
+
+    return {
+        "recovered": True,
+        "provider": current_provider,
+        "source": source_path,
+        "mode": recovery_mode,
+    }
 
 
 def read_first_line_record(file_path: Path) -> tuple[str, bytes, bytes, bytes]:
@@ -413,7 +623,7 @@ def read_sqlite_provider_counts(codex_home: Path) -> dict[str, Any] | None:
     if not db_path:
         return None
     try:
-        with sqlite_connect(db_path, read_only=True) as conn:
+        with closing(sqlite_connect(db_path, read_only=True)) as conn:
             columns = table_columns(conn, "threads")
             if "model_provider" not in columns:
                 return {"sessions": {}, "archived_sessions": {}}
@@ -455,7 +665,7 @@ def read_sqlite_repair_stats(
     db_path = existing_state_db_path(codex_home)
     if not db_path:
         return None
-    with sqlite_connect(db_path, read_only=True) as conn:
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
         columns = table_columns(conn, "threads")
         user_event_rows = 0
         if "has_user_event" in columns and user_event_thread_ids:
@@ -480,7 +690,7 @@ def read_sqlite_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
     if not db_path:
         return {}
     try:
-        with sqlite_connect(db_path, read_only=True) as conn:
+        with closing(sqlite_connect(db_path, read_only=True)) as conn:
             columns = table_columns(conn, "threads")
             wanted = ["id", "title", "model_provider", "archived", "cwd"]
             selected = [column for column in wanted if column in columns]
@@ -636,7 +846,7 @@ def read_project_thread_visibility(codex_home: Path, page_size: int = 50) -> lis
             "providerCounts": {},
         } for root in roots]
 
-    with sqlite_connect(db_path, read_only=True) as conn:
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
         columns = table_columns(conn, "threads")
         if "cwd" not in columns:
             return []
@@ -709,6 +919,7 @@ def get_status(codex_home: Path) -> dict[str, Any]:
     config_text = read_config_text(codex_home)
     current_provider, current_provider_implicit = read_current_provider_from_config_text(config_text)
     configured_providers = list_configured_provider_ids(config_text)
+    config_provider_error = provider_config_error(config_text)
     rollout = collect_rollout_status(codex_home, "__status_only__")
     sqlite_counts = read_sqlite_provider_counts(codex_home)
     sqlite_repair_stats = None
@@ -725,6 +936,7 @@ def get_status(codex_home: Path) -> dict[str, Any]:
         "currentProvider": current_provider,
         "currentProviderImplicit": current_provider_implicit,
         "configuredProviders": configured_providers,
+        "configProviderError": config_provider_error,
         "rolloutCounts": rollout["provider_counts"],
         "subagentRolloutCounts": rollout["subagent_counts"],
         "lockedRolloutFiles": rollout["locked_paths"],
@@ -778,6 +990,8 @@ def print_status(codex_home: Path) -> None:
     print(f"对话仓库：{status['codexHome']}")
     print()
     print(f"本电脑有 {len(status['configuredProviders'])} 个 provider：{'，'.join(status['configuredProviders'])}；当前的 provider 是：{status['currentProvider']}")
+    if status.get("configProviderError"):
+        print(f"配置警告：{status['configProviderError']}")
     print()
     print(
         f"顶层对话记录有 {rollout_total} 条；分别是：{format_counts(rollout_session_counts)}；"
@@ -918,7 +1132,37 @@ def target_path_for_backup_rollout(codex_home: Path, backup: dict[str, Any], sou
     return codex_home / "sessions" / relative
 
 
-def restore_conversation_files(codex_home: Path, backup: dict[str, Any], requested_count: int) -> dict[str, Any]:
+def rewrite_rollout_provider(file_path: Path, target_provider: str) -> bool:
+    first_line, separator, rest, _ = read_first_line_record(file_path)
+    record = parse_session_meta(first_line)
+    if not record:
+        raise RuntimeError(f"恢复文件缺少有效 session_meta：{file_path}")
+    payload = record["payload"]
+    if payload.get("model_provider") == target_provider:
+        return False
+
+    original_stat = file_path.stat()
+    record["payload"]["model_provider"] = target_provider
+    updated_first_line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    temporary_path = file_path.with_name(
+        f"{file_path.name}.provider-restore.{os.getpid()}.{int(datetime.now().timestamp() * 1000)}.tmp"
+    )
+    try:
+        temporary_path.write_bytes(updated_first_line.encode("utf-8") + separator + rest)
+        os.replace(temporary_path, file_path)
+        os.utime(file_path, (original_stat.st_atime, original_stat.st_mtime))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+    return True
+
+
+def restore_conversation_files(
+    codex_home: Path,
+    backup: dict[str, Any],
+    requested_count: int,
+    target_provider: str | None = None,
+) -> dict[str, Any]:
     all_rollouts = list_backup_rollout_files(backup)
     conversations = [item for item in all_rollouts if not item["is_subagent"]]
     count = len(conversations) if requested_count >= len(conversations) else max(0, requested_count)
@@ -940,14 +1184,18 @@ def restore_conversation_files(codex_home: Path, backup: dict[str, Any], request
         if not added:
             break
     index_names = read_session_index_names(codex_home)
+    provider_updates = 0
     for item in selected + internal_selected:
         target_path = target_path_for_backup_rollout(codex_home, backup, item["source_path"])
         target_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item["source_path"], target_path)
+        if target_provider:
+            provider_updates += int(rewrite_rollout_provider(target_path, target_provider))
     return {
         "restored": len(selected),
         "available": len(conversations),
         "internalRestored": len(internal_selected),
+        "providerUpdated": provider_updates,
         "items": [
             {
                 "id": item["id"],
@@ -975,6 +1223,7 @@ def parse_positive_integer(value: str) -> int | None:
 
 
 def run_restore_flow(codex_home: Path) -> None:
+    _, target_provider, _ = load_operation_provider_config(codex_home)
     initial_backups = list_conversation_backups(codex_home)
     print(f"可恢复对话文件备份：{len(initial_backups)} 个")
     if not initial_backups:
@@ -1026,9 +1275,10 @@ def run_restore_flow(codex_home: Path) -> None:
         print("已退出，未恢复任何内容。")
         return
 
-    result = restore_conversation_files(codex_home, target_backup, requested_count)
+    result = restore_conversation_files(codex_home, target_backup, requested_count, target_provider)
     print(f"恢复完成：{result['restored']}/{result['available']} 条。")
     print(f"随父对话恢复内部子线程：{result['internalRestored']} 条。")
+    print(f"已统一恢复文件的 provider：{result['providerUpdated']} 个。")
     if result["items"]:
         print("恢复 ID 列表：")
         for index, item in enumerate(result["items"], start=1):
@@ -1045,7 +1295,7 @@ def backup_sqlite_files(codex_home: Path, db_path: Path) -> Path:
     return backup_dir
 
 
-def build_insert_row(conversation: dict[str, Any]) -> dict[str, Any]:
+def build_insert_row(conversation: dict[str, Any], fallback_provider: str) -> dict[str, Any]:
     title = clean_text(conversation.get("name") or conversation.get("id"))
     source = conversation.get("source")
     if not isinstance(source, str) or not source.strip():
@@ -1064,7 +1314,8 @@ def build_insert_row(conversation: dict[str, Any]) -> dict[str, Any]:
         "created_at": created_at,
         "updated_at": updated_at,
         "source": source,
-        "model_provider": conversation.get("provider") or "custom",
+        # A backfilled row must match the provider that config.toml currently exposes.
+        "model_provider": fallback_provider,
         "cwd": conversation.get("cwd") or "",
         "title": title,
         "sandbox_policy": '{"type":"disabled"}',
@@ -1092,6 +1343,7 @@ def build_insert_row(conversation: dict[str, Any]) -> dict[str, Any]:
 
 
 def backfill_missing_threads(codex_home: Path) -> dict[str, Any]:
+    config_text, target_provider, _ = load_operation_provider_config(codex_home)
     db_path = existing_state_db_path(codex_home)
     if not db_path:
         raise RuntimeError("找不到 state_5.sqlite，无法入库。")
@@ -1101,12 +1353,16 @@ def backfill_missing_threads(codex_home: Path) -> dict[str, Any]:
     if not missing:
         return {"inserted": 0, "backupDir": backup_dir, "ids": []}
 
-    with sqlite_connect(db_path) as conn:
+    with closing(sqlite_connect(db_path)) as conn:
         columns = table_columns(conn, "threads")
         conn.execute("BEGIN IMMEDIATE")
         try:
             for conversation in missing:
-                row = {key: value for key, value in build_insert_row(conversation).items() if key in columns}
+                row = {
+                    key: value
+                    for key, value in build_insert_row(conversation, target_provider).items()
+                    if key in columns
+                }
                 names = list(row.keys())
                 placeholders = ", ".join(f":{name}" for name in names)
                 conn.execute(
@@ -1363,7 +1619,7 @@ def read_thread_cwd_stats(codex_home: Path) -> list[dict[str, Any]]:
     db_path = existing_state_db_path(codex_home)
     if not db_path:
         return []
-    with sqlite_connect(db_path, read_only=True) as conn:
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
         columns = table_columns(conn, "threads")
         if "cwd" not in columns:
             return []
@@ -1488,7 +1744,7 @@ def update_sqlite_provider(
             "databasePresent": False,
         }
 
-    with sqlite_connect(db_path) as conn:
+    with closing(sqlite_connect(db_path)) as conn:
         columns = table_columns(conn, "threads")
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1533,14 +1789,14 @@ def update_sqlite_provider(
 
 
 def sync(codex_home: Path) -> None:
-    config_text = read_config_text(codex_home)
-    target_provider, _ = read_current_provider_from_config_text(config_text)
+    config_text, target_provider, _ = load_operation_provider_config(codex_home)
     rollout = collect_rollout_status(codex_home, target_provider)
     changes = rollout["changes"]
 
     print("正在扫描对话文件...")
     print("正在创建备份...")
     backup_dir = copy_provider_sync_backup(codex_home, target_provider, changes)
+    validate_config_snapshot(codex_home, config_text, target_provider)
 
     applied_changes: list[dict[str, Any]] = []
     workspace_result = {"updatedWorkspaceRoots": 0, "savedWorkspaceRootCount": 0}
@@ -1555,6 +1811,7 @@ def sync(codex_home: Path) -> None:
 
     try:
         print("正在更新 SQLite...")
+        validate_config_snapshot(codex_home, config_text, target_provider)
         sqlite_result = update_sqlite_provider(
             codex_home,
             target_provider,
@@ -1580,6 +1837,8 @@ def sync(codex_home: Path) -> None:
 
 
 def interactive(codex_home: Path) -> None:
+    # Repair and validate provider configuration before any backup or restore choice is shown.
+    load_operation_provider_config(codex_home)
     print_status(codex_home)
     print()
     print("选择：")
