@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import sys
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ DEFAULT_PROVIDER = "openai"
 SESSION_DIRS = ("sessions", "archived_sessions")
 DB_FILE_BASENAME = "state_5.sqlite"
 SQLITE_DIR_BASENAME = "sqlite"
+CATALOG_DB_BASENAME = "codex-dev.db"
 PROVIDER_BACKUP_NAMESPACE = "provider-sync"
 CONVERSATION_BACKUP_NAMESPACE = "py-provider-sync"
 DB_CLEANUP_BACKUP_NAMESPACE = "manual-db-cleanup"
@@ -161,16 +162,19 @@ def read_config_text(codex_home: Path) -> str:
 
 
 def read_current_provider_from_config_text(config_text: str) -> tuple[str, bool]:
-    for line in re.split(r"\r?\n", config_text):
-        trimmed = line.strip()
-        if not trimmed or trimmed.startswith("#"):
-            continue
-        if trimmed.startswith("["):
-            break
-        match = re.match(r'''^model_provider\s*=\s*(["'])([^"']+)\1\s*$''', trimmed)
-        if match:
-            return match.group(2), False
-    return DEFAULT_PROVIDER, True
+    if tomllib is None:
+        raise RuntimeError("需要 Python 3.11+ 或 tomli，才能准确解析 provider 配置。")
+    config = tomllib.loads(config_text)
+    profile_name = config.get("profile")
+    profile = config.get("profiles", {}).get(profile_name, {}) if profile_name else {}
+    if profile_name and not isinstance(profile, dict):
+        raise RuntimeError("当前 profile 配置无效。")
+    if profile_name and profile_name not in config.get("profiles", {}):
+        raise RuntimeError("config.toml 指定的 profile 不存在。")
+    provider = profile.get("model_provider", config.get("model_provider", DEFAULT_PROVIDER))
+    if not isinstance(provider, str) or not provider.strip():
+        raise RuntimeError("model_provider 必须是非空字符串。")
+    return provider, "model_provider" not in profile and "model_provider" not in config
 
 
 def list_configured_provider_ids(config_text: str) -> list[str]:
@@ -205,7 +209,7 @@ def provider_config_error(config_text: str) -> str | None:
     except tomllib.TOMLDecodeError as error:
         return f"config.toml 不是有效的 TOML：{error}"
 
-    current_provider = config.get("model_provider", DEFAULT_PROVIDER)
+    current_provider, _ = read_current_provider_from_config_text(config_text)
     if not isinstance(current_provider, str) or not current_provider.strip():
         return "config.toml 的 model_provider 不是有效的字符串"
     if current_provider == DEFAULT_PROVIDER:
@@ -231,15 +235,10 @@ def validate_provider_config(config_text: str) -> tuple[str, bool]:
 
 
 def load_operation_provider_config(codex_home: Path) -> tuple[str, str, bool]:
-    recovery = recover_provider_config(codex_home)
+    # Never restore an old relay endpoint merely to make its provider ID exist.
     config_text = read_config_text(codex_home)
     current_provider, _ = validate_provider_config(config_text)
-    if recovery["recovered"]:
-        print(
-            "已从历史同步备份恢复缺失的 provider 配置："
-            f"{recovery['source']}"
-        )
-    return config_text, current_provider, bool(recovery["recovered"])
+    return config_text, current_provider, False
 
 
 def validate_config_snapshot(
@@ -570,6 +569,11 @@ def detect_state_db(codex_home: Path) -> dict[str, Any] | None:
 def existing_state_db_path(codex_home: Path) -> Path | None:
     detected = detect_state_db(codex_home)
     return detected["path"] if detected else None
+
+
+def existing_catalog_db_path(codex_home: Path) -> Path | None:
+    path = codex_home / SQLITE_DIR_BASENAME / CATALOG_DB_BASENAME
+    return path if path.exists() else None
 
 
 def sqlite_connect(db_path: Path, read_only: bool = False) -> sqlite3.Connection:
@@ -1191,11 +1195,18 @@ def restore_conversation_files(
         shutil.copy2(item["source_path"], target_path)
         if target_provider:
             provider_updates += int(rewrite_rollout_provider(target_path, target_provider))
+    catalog_result = repair_local_thread_catalog(
+        codex_home,
+        selected_ids,
+        target_provider,
+    )
     return {
         "restored": len(selected),
         "available": len(conversations),
         "internalRestored": len(internal_selected),
         "providerUpdated": provider_updates,
+        "catalogInserted": catalog_result["inserted"],
+        "catalogUpdated": catalog_result["updated"],
         "items": [
             {
                 "id": item["id"],
@@ -1204,6 +1215,91 @@ def restore_conversation_files(
             for item in selected
         ],
     }
+
+
+def repair_local_thread_catalog(
+    codex_home: Path,
+    thread_ids: set[str],
+    target_provider: str | None,
+) -> dict[str, int]:
+    """Rebuild the newer Codex sidebar catalog from canonical threads rows."""
+    catalog_path = existing_catalog_db_path(codex_home)
+    state_path = existing_state_db_path(codex_home)
+    if not catalog_path or not state_path or not thread_ids:
+        return {"inserted": 0, "updated": 0}
+
+    with closing(sqlite_connect(state_path, read_only=True)) as source, closing(sqlite_connect(catalog_path)) as catalog:
+        if not table_exists(catalog, "local_thread_catalog"):
+            return {"inserted": 0, "updated": 0}
+        source_columns = table_columns(source, "threads")
+        catalog_columns = table_columns(catalog, "local_thread_catalog")
+        required = {"id", "title", "rollout_path"}
+        if not required.issubset(source_columns) or not {"host_id", "thread_id"}.issubset(catalog_columns):
+            return {"inserted": 0, "updated": 0}
+
+        source_rows = source.execute("SELECT * FROM threads WHERE id IN ({})".format(",".join("?" * len(thread_ids))), tuple(thread_ids)).fetchall()
+        insert_columns = [
+            column for column in (
+                "host_id", "thread_id", "display_title", "source_created_at", "source_updated_at",
+                "cwd", "source_kind", "source_detail", "model_provider", "git_branch",
+                "observation_sequence", "missing_candidate", "thread_source", "source_recency_at",
+                "pending_observed_title", "project_id", "conversation_origin",
+            ) if column in catalog_columns
+        ]
+        if not insert_columns:
+            return {"inserted": 0, "updated": 0}
+        catalog.execute("BEGIN IMMEDIATE")
+        inserted = updated = 0
+        try:
+            max_sequence = catalog.execute(
+                "SELECT COALESCE(MAX(observation_sequence), 0) FROM local_thread_catalog WHERE host_id = 'local'"
+            ).fetchone()[0]
+            for row in source_rows:
+                thread_id = str(row["id"])
+                values = {
+                    "host_id": "local",
+                    "thread_id": thread_id,
+                    "display_title": row["title"] or row["id"],
+                    "source_created_at": (row["created_at_ms"] if "created_at_ms" in source_columns else row["created_at"] * 1000) / 1000,
+                    "source_updated_at": (row["updated_at_ms"] if "updated_at_ms" in source_columns else row["updated_at"] * 1000) / 1000,
+                    "cwd": row["cwd"] if "cwd" in source_columns else "",
+                    "source_kind": row["source"] if "source" in source_columns else "cli",
+                    "source_detail": row["rollout_path"],
+                    "model_provider": target_provider or (row["model_provider"] if "model_provider" in source_columns else DEFAULT_PROVIDER),
+                    "git_branch": row["git_branch"] if "git_branch" in source_columns else None,
+                    "observation_sequence": int(max_sequence) + inserted + 1,
+                    "missing_candidate": 0,
+                    "thread_source": row["thread_source"] if "thread_source" in source_columns else None,
+                    "source_recency_at": (row["updated_at_ms"] if "updated_at_ms" in source_columns else row["updated_at"] * 1000) / 1000,
+                    "pending_observed_title": 0,
+                    "project_id": row["project_id"] if "project_id" in source_columns else None,
+                    "conversation_origin": None,
+                }
+                existing = catalog.execute(
+                    "SELECT 1 FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = ?",
+                    (thread_id,),
+                ).fetchone()
+                if existing:
+                    updates = [column for column in ("display_title", "source_detail", "model_provider", "cwd", "source_updated_at", "source_recency_at") if column in catalog_columns]
+                    catalog.execute(
+                        f"UPDATE local_thread_catalog SET {', '.join(f'{c} = ?' for c in updates)} WHERE host_id = 'local' AND thread_id = ?",
+                        tuple(values[c] for c in updates) + (thread_id,),
+                    )
+                    updated += 1
+                else:
+                    placeholders = ", ".join("?" for _ in insert_columns)
+                    catalog.execute(
+                        f"INSERT OR IGNORE INTO local_thread_catalog ({', '.join(insert_columns)}) VALUES ({placeholders})",
+                        tuple(values[c] for c in insert_columns),
+                    )
+                    inserted += 1
+            if table_exists(catalog, "local_thread_catalog_metadata") and inserted + updated:
+                catalog.execute("UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1")
+            catalog.commit()
+        except Exception:
+            catalog.rollback()
+            raise
+    return {"inserted": inserted, "updated": updated}
 
 
 def delete_conversation_backups(codex_home: Path) -> dict[str, Any]:
@@ -1279,6 +1375,7 @@ def run_restore_flow(codex_home: Path) -> None:
     print(f"恢复完成：{result['restored']}/{result['available']} 条。")
     print(f"随父对话恢复内部子线程：{result['internalRestored']} 条。")
     print(f"已统一恢复文件的 provider：{result['providerUpdated']} 个。")
+    print(f"已同步新版侧边栏目录：新增 {result['catalogInserted']} 条，更新 {result['catalogUpdated']} 条。")
     if result["items"]:
         print("恢复 ID 列表：")
         for index, item in enumerate(result["items"], start=1):
@@ -1544,13 +1641,12 @@ def copy_provider_sync_backup(codex_home: Path, target_provider: str, changes: l
     config_path = codex_home / "config.toml"
     if config_path.exists():
         shutil.copy2(config_path, backup_dir / "config.toml")
-    db_path = existing_state_db_path(codex_home)
-    if db_path:
-        sqlite_backup = backup_dir / "sqlite"
-        sqlite_backup.mkdir(parents=True, exist_ok=True)
-        for source_path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
-            if source_path.exists():
-                shutil.copy2(source_path, sqlite_backup / source_path.name)
+    for source_path in provider_database_paths(codex_home):
+        destination = backup_dir / source_path.relative_to(codex_home)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite_connect(source_path, read_only=True)) as source:
+            with closing(sqlite3.connect(destination)) as target:
+                source.backup(target)
     session_manifest = []
     for change in changes:
         source_path = change["path"]
@@ -1726,6 +1822,14 @@ def sync_workspace_roots(codex_home: Path) -> dict[str, Any]:
     }
 
 
+def provider_database_paths(codex_home: Path) -> list[Path]:
+    paths = [entry["path"] for entry in state_db_candidates(codex_home) if entry["path"].exists()]
+    catalog = existing_catalog_db_path(codex_home)
+    if catalog:
+        paths.append(catalog)
+    return paths
+
+
 def update_sqlite_provider(
     codex_home: Path,
     target_provider: str,
@@ -1733,65 +1837,89 @@ def update_sqlite_provider(
     thread_cwd_by_id: dict[str, str],
     after_update,
 ) -> dict[str, Any]:
-    db_path = existing_state_db_path(codex_home)
-    if not db_path:
-        after_update()
-        return {
-            "updatedRows": 0,
-            "providerRowsUpdated": 0,
-            "userEventRowsUpdated": 0,
-            "cwdRowsUpdated": 0,
-            "databasePresent": False,
-        }
-
-    with closing(sqlite_connect(db_path)) as conn:
-        columns = table_columns(conn, "threads")
-        conn.execute("BEGIN IMMEDIATE")
+    paths = provider_database_paths(codex_home)
+    provider_rows = user_event_rows = cwd_rows = catalog_rows = 0
+    with ExitStack() as stack:
+        connections = [stack.enter_context(closing(sqlite_connect(path))) for path in paths]
         try:
-            provider_rows = 0
-            if "model_provider" in columns:
-                provider_rows = conn.execute(
-                    "UPDATE threads SET model_provider = ? WHERE COALESCE(model_provider, '') <> ?",
-                    (target_provider, target_provider),
-                ).rowcount
-
-            user_event_rows = 0
-            if "has_user_event" in columns:
-                for thread_id in user_event_thread_ids:
-                    user_event_rows += conn.execute(
-                        "UPDATE threads SET has_user_event = 1 WHERE id = ? AND COALESCE(has_user_event, 0) <> 1",
-                        (thread_id,),
+            # Lock every database before applying changes, including both state layouts.
+            for conn in connections:
+                conn.execute("BEGIN IMMEDIATE")
+            for conn in connections:
+                columns = table_columns(conn, "threads")
+                if "model_provider" in columns:
+                    provider_rows += conn.execute(
+                        "UPDATE threads SET model_provider = ? WHERE COALESCE(model_provider, '') <> ?",
+                        (target_provider, target_provider),
                     ).rowcount
-
-            cwd_rows = 0
-            if "cwd" in columns:
-                for thread_id, cwd in thread_cwd_by_id.items():
-                    if not thread_id or not cwd.strip():
-                        continue
-                    cwd_rows += conn.execute(
-                        "UPDATE threads SET cwd = ? WHERE id = ? AND COALESCE(cwd, '') <> ?",
-                        (cwd, thread_id, cwd),
+                if {"id", "has_user_event"}.issubset(columns):
+                    for thread_id in user_event_thread_ids:
+                        user_event_rows += conn.execute(
+                            "UPDATE threads SET has_user_event = 1 WHERE id = ? AND COALESCE(has_user_event, 0) <> 1",
+                            (thread_id,),
+                        ).rowcount
+                if {"id", "cwd"}.issubset(columns):
+                    for thread_id, cwd in thread_cwd_by_id.items():
+                        if thread_id and cwd.strip():
+                            cwd_rows += conn.execute(
+                                "UPDATE threads SET cwd = ? WHERE id = ? AND COALESCE(cwd, '') <> ?",
+                                (cwd, thread_id, cwd),
+                            ).rowcount
+                catalog_columns = table_columns(conn, "local_thread_catalog")
+                if {"host_id", "model_provider"}.issubset(catalog_columns):
+                    changed = conn.execute(
+                        "UPDATE local_thread_catalog SET model_provider = ? "
+                        "WHERE host_id = 'local' AND COALESCE(model_provider, '') <> ?",
+                        (target_provider, target_provider),
                     ).rowcount
-
+                    catalog_rows += changed
+                    if changed and "catalog_revision" in table_columns(conn, "local_thread_catalog_metadata"):
+                        conn.execute("UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1")
+                if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise RuntimeError("SQLite 完整性校验失败，已停止同步。")
             after_update()
-            conn.commit()
+            for conn in connections:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            for conn in connections:
+                conn.rollback()
+            # Separate database commits are not crash-atomic; full snapshots are retained.
             raise
-
     return {
-        "updatedRows": provider_rows + user_event_rows + cwd_rows,
+        "updatedRows": provider_rows + user_event_rows + cwd_rows + catalog_rows,
         "providerRowsUpdated": provider_rows,
         "userEventRowsUpdated": user_event_rows,
         "cwdRowsUpdated": cwd_rows,
-        "databasePresent": True,
+        "catalogRowsUpdated": catalog_rows,
+        "databasePresent": bool(paths),
     }
+
+
+def verify_provider_sync(codex_home: Path, target_provider: str) -> None:
+    for path in provider_database_paths(codex_home):
+        with closing(sqlite_connect(path, read_only=True)) as conn:
+            for table, condition in (("threads", "1=1"), ("local_thread_catalog", "host_id = 'local'")):
+                if "model_provider" in table_columns(conn, table):
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {condition} AND COALESCE(model_provider, '') <> ?",
+                        (target_provider,),
+                    ).fetchone()[0]
+                    if count:
+                        raise RuntimeError(f"同步校验失败：{path.name}/{table} 仍有 {count} 条 provider 不一致。")
+    for directory in SESSION_DIRS:
+        for path in list_rollout_files(codex_home / directory):
+            with path.open(encoding="utf-8") as handle:
+                record = parse_session_meta(handle.readline())
+            if record and record["payload"].get("model_provider") != target_provider:
+                raise RuntimeError(f"同步校验失败：{path} provider 不一致。")
 
 
 def sync(codex_home: Path) -> None:
     config_text, target_provider, _ = load_operation_provider_config(codex_home)
     rollout = collect_rollout_status(codex_home, target_provider)
     changes = rollout["changes"]
+    if rollout["locked_paths"]:
+        raise RuntimeError("部分会话文件无法读取，已停止同步，请关闭应用后重试。")
 
     print("正在扫描对话文件...")
     print("正在创建备份...")
@@ -1807,6 +1935,8 @@ def sync(codex_home: Path) -> None:
         for change in changes:
             if rewrite_rollout_first_line(change):
                 applied_changes.append(change)
+            else:
+                raise RuntimeError(f"会话文件发生变化或无法写入：{change['path']}")
         workspace_result = sync_workspace_roots(codex_home)
 
     try:
@@ -1823,25 +1953,38 @@ def sync(codex_home: Path) -> None:
         restore_rollout_first_lines(applied_changes)
         raise
 
-    print("正在清理旧备份...")
-    prune_provider_backups(codex_home, 5)
+    validate_config_snapshot(codex_home, config_text, target_provider)
+    verify_provider_sync(codex_home, target_provider)
+    # Keep snapshots; provider migration must not delete older recovery points.
 
     print("保存完成。")
     print(f"目标 provider：{target_provider}")
     print(f"本次备份：{backup_dir}")
     print(f"已更新对话文件：{len(applied_changes)} 个")
     print(f"已更新 SQLite provider 行：{sqlite_result['providerRowsUpdated']} 行")
+    print(f"已更新本机目录索引 provider：{sqlite_result['catalogRowsUpdated']} 行")
+    print("provider 一致性校验通过。")
     print(f"已修复 user-event：{sqlite_result['userEventRowsUpdated']} 行")
     print(f"已修复 cwd 路径：{sqlite_result['cwdRowsUpdated']} 行")
     print(f"已更新项目路径缓存：{workspace_result.get('updatedWorkspaceRoots') or 0} 个")
 
 
 def interactive(codex_home: Path) -> None:
-    # Repair and validate provider configuration before any backup or restore choice is shown.
-    load_operation_provider_config(codex_home)
-    print_status(codex_home)
+    # Deletion remains available even when provider configuration is invalid.
+    try:
+        print_status(codex_home)
+    except Exception as error:
+        print(f"状态读取失败（仍可输入 A 按链接删除）：{error}")
     print()
     print("选择：")
+    mode = input("输入 S：同步当前 provider；输入 A：按深度链接删除指定对话；其它键：备份恢复菜单：")
+    if mode.strip().upper() == "A":
+        from codex_delete_conversation import interactive_delete
+        interactive_delete(codex_home)
+        return
+    if mode.strip().upper() == "S":
+        sync(codex_home)
+        return
     backup_answer = input("是否进行对话恢复备份？Y：备份；其它键跳过：")
     if backup_answer.strip().upper() == "Y":
         backup_result = create_conversation_backup(codex_home)
@@ -1860,6 +2003,7 @@ def interactive(codex_home: Path) -> None:
     first_answer = input("输入 B：将未入库的对话入库；输入 C：清理数据库异常记录；其它键继续：")
     if first_answer.strip().upper() == "B":
         backfill(codex_home)
+        sync(codex_home)
         return
     if first_answer.strip().upper() == "C":
         cleanup(codex_home)

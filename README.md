@@ -14,7 +14,9 @@ The current version is positioned as a practical tool for local session inspecti
 - 从备份中恢复最近若干条对话
 - 将未入库对话补写入 SQLite
 - 预览并清理没有对应 rollout 文件的 SQLite 异常记录
-- 同步 provider 相关元数据
+- 同步 provider 相关元数据（覆盖两份 state 数据库和本机目录索引）
+- 按深度链接预览并精确删除指定对话及已识别的本机关联记录
+- 运行结束后可选择打开 ChatGPT
 - 修复一部分影响列表可见性的本地状态
 
 ## What This Tool Does / 这工具现在能做什么
@@ -37,7 +39,13 @@ This project works on local Codex data under `~/.codex`.
    - 预览并删除数据库中存在、但 rollout 对话文件已经不存在的异常记录
 5. `sync`
    - Sync provider-related metadata and repair related local state
-   - 同步 provider 相关元数据，并修复相关本地状态
+   - 同步 provider 相关元数据（覆盖两份 state 数据库和本机目录索引）
+6. `delete by link`
+   - Preview and precisely delete one local conversation by its full deep-link ID
+   - 按深度链接预览并精确删除指定对话及已识别的本机关联记录
+7. Windows completion prompt
+   - Ask whether to open the local ChatGPT app after the batch file finishes
+   - 批处理结束后询问是否打开本机 ChatGPT
 
 ## Why This Exists / 为什么会有这个工具
 
@@ -65,6 +73,8 @@ Main paths used by this tool:
 ```text
 ~/.codex/config.toml
 ~/.codex/sqlite/state_5.sqlite
+~/.codex/state_5.sqlite
+~/.codex/sqlite/codex-dev.db
 ~/.codex/session_index.jsonl
 ~/.codex/sessions/**/*.jsonl
 ~/.codex/.codex-global-state.json
@@ -86,6 +96,7 @@ Current local structure:
 
 ```text
 codex_provider_local_launcher.py
+codex_delete_conversation.py
 close_codex_desktop.ps1
 README.md
 同步恢复对话.bat
@@ -110,6 +121,18 @@ All launchers call the same Python program. The Windows launcher first calls `cl
 ```text
 ~/.codex/sqlite/state_5.sqlite
 ```
+
+## Current Windows Menu / 当前 Windows 菜单
+
+运行 `同步恢复对话.bat` 并关闭 Codex Desktop 后，会进入交互菜单：
+
+- `S`：将会话文件、两份 SQLite state 数据库和本机目录索引统一到当前 `model_provider`，并执行一致性校验。
+- `A`：输入 `codex://threads/<完整对话ID>` 深度链接；程序先显示标题、最近一轮消息和删除清单，再次输入 `Y` 才删除。取消不会写入数据。
+- 其他键：进入原有备份、恢复、补录和异常清理流程。
+
+选择 `A` 时只接受本机 Codex 线程深度链接，不接受分享链接、远程链接或模糊标题匹配。会话文件、历史索引、目标/队列/日志等本地数据库中按已识别字段保存的该完整线程 ID 关联会按字段处理；无法确认归属的内容、其他线程、远程主机记录和项目文件不会删除。删除成功后不会保留该对话的临时恢复副本。
+
+批处理流程结束时还会询问“是否打开 ChatGPT？N：不打开，其余键或直接回车：打开”。输入 `N` 或 `n` 不打开，其他输入（包括直接回车）启动本机 ChatGPT 应用。
 
 ## Quick Start / 快速开始
 
@@ -219,28 +242,14 @@ This matches the current local script behavior.
 
 ## Interactive Workflow / 交互流程
 
-The current interactive workflow is:
+The Windows batch file closes the packaged Codex Desktop process, validates its helpers and Python, then starts `interactive` mode. The first menu is:
 
-1. Ask whether to create a conversation-restore backup first  
-   先询问是否创建“对话恢复备份”
-2. Choose `B` to backfill conversations missing from SQLite, or `C` to preview database cleanup candidates  
-   可输入 `B` 将未入库对话写入 SQLite，或输入 `C` 预览数据库异常记录
-3. Cleanup requires a second explicit `Y` confirmation and creates a full SQLite backup first  
-   异常清理要求再次输入 `Y`，并先创建完整 SQLite 备份
-4. Enter restore flow when neither `B` nor `C` is selected  
-   进入恢复流程
-5. Optionally delete all restore backups  
-   可选删除全部恢复备份
-6. Choose latest backup or manually choose one backup  
-   选择最新备份，或手动选择某一份备份
-7. Enter how many conversations to restore  
-   输入要恢复多少条对话
-8. Confirm restore  
-   确认是否恢复
-9. Ask whether to save at the end  
-   最后询问是否保存
-10. If confirmed, run `sync`  
-   若确认保存，则执行同步
+1. Enter `S` to sync the current provider across conversation files, both state databases, and the local desktop catalog.
+2. Enter `A` to paste a full `codex://threads/<thread-id>` deep link. The tool shows the title, latest available user/assistant turn, exact deletion list, and asks for `Y` again before deleting.
+3. Enter any other key to continue the original backup/restore/backfill/cleanup menu.
+
+After the batch workflow finishes, it asks whether to open ChatGPT. `N` or `n` leaves it closed; every other input, including an empty Enter, opens the installed `OpenAI.Codex` ChatGPT app.
+
 
 ## Backup Types / 备份类型
 
@@ -256,15 +265,9 @@ Used before `sync` writes local provider-related state.
 
 用于 `sync` 写入前，备份相关本地状态。
 
-Current retention in code:
+Provider-sync backups are retained for rollback; the deletion workflow does not use them as a reason to delete other conversations.
 
-```text
-5 backups
-```
-
-This is implemented in:
-
-- `prune_provider_backups(codex_home, 5)`
+同步备份用于回滚；删除指定对话时会精确清理其中该 ID 的副本，不会清理其他对话。
 
 ### 2. Conversation Restore Backup / 对话恢复备份
 
