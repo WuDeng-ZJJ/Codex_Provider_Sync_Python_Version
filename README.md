@@ -250,7 +250,6 @@ The Windows batch file closes the packaged Codex Desktop process, validates its 
 
 After the batch workflow finishes, it asks whether to open ChatGPT. `N` or `n` leaves it closed; every other input, including an empty Enter, opens the installed `OpenAI.Codex` ChatGPT app.
 
-
 ## Backup Types / 备份类型
 
 ### 1. Provider Sync Backup / 同步备份
@@ -344,15 +343,6 @@ Expected:
 
 - it should point to `codex_provider_local_launcher.py`
 - it should detect `python` or `py`
-
-## Suggested .gitignore / 建议 .gitignore
-
-```gitignore
-__pycache__/
-*.pyc
-.DS_Store
-Thumbs.db
-```
 
 ## License
 
