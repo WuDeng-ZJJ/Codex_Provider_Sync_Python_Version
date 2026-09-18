@@ -732,6 +732,30 @@ def read_rollout_sessions(codex_home: Path) -> list[dict[str, Any]]:
     return sessions
 
 
+def deduplicate_rollout_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the newest rollout file for each top-level or subagent thread ID.
+
+    A single Codex thread can have several rollout files after multiple turns or
+    forks.  ``threads.id`` is unique, so treating every file as a new thread
+    makes backfill attempt duplicate inserts.
+    """
+    newest: dict[tuple[bool, str], dict[str, Any]] = {}
+    for session in sessions:
+        thread_id = str(session.get("id") or "").strip()
+        if not thread_id:
+            continue
+        key = (bool(session.get("is_subagent")), thread_id)
+        previous = newest.get(key)
+        if previous is None:
+            newest[key] = session
+            continue
+        current_key = (parse_time_ms(session.get("timestamp")), str(session.get("file_path", "")))
+        previous_key = (parse_time_ms(previous.get("timestamp")), str(previous.get("file_path", "")))
+        if current_key > previous_key:
+            newest[key] = session
+    return list(newest.values())
+
+
 def read_session_index_names(codex_home: Path) -> dict[str, dict[str, str]]:
     index_path = codex_home / "session_index.jsonl"
     names: dict[str, dict[str, str]] = {}
@@ -758,7 +782,7 @@ def read_session_index_names(codex_home: Path) -> dict[str, dict[str, str]]:
 
 
 def build_conversation_details(codex_home: Path) -> list[dict[str, Any]]:
-    rollouts = read_rollout_sessions(codex_home)
+    rollouts = deduplicate_rollout_sessions(read_rollout_sessions(codex_home))
     index_names = read_session_index_names(codex_home)
     sqlite_rows = read_sqlite_thread_rows(codex_home)
     details: list[dict[str, Any]] = []
@@ -970,7 +994,11 @@ def get_repair_total(status: dict[str, Any], hidden_count: int) -> dict[str, int
 def print_status(codex_home: Path) -> None:
     status = get_status(codex_home)
     conversations = build_conversation_details(codex_home)
-    rollout_session_counts = status["rolloutCounts"].get("sessions") or {}
+    # The sessions directory may contain several rollout files for one thread.
+    # Use the same unique-thread view as the backfill workflow for the summary.
+    rollout_session_counts = dict(
+        Counter(str(conversation.get("provider") or "(missing)") for conversation in conversations)
+    )
     subagent_session_counts = status["subagentRolloutCounts"].get("sessions") or {}
     sqlite_session_counts = get_sqlite_session_counts(status)
     rollout_total = sum_counts(rollout_session_counts)
@@ -1445,16 +1473,35 @@ def backfill_missing_threads(codex_home: Path) -> dict[str, Any]:
     if not db_path:
         raise RuntimeError("找不到 state_5.sqlite，无法入库。")
     conversations = build_conversation_details(codex_home)
-    missing = [conversation for conversation in conversations if not conversation["in_sqlite"]]
+    missing_by_id: dict[str, dict[str, Any]] = {}
+    for conversation in conversations:
+        if not conversation["in_sqlite"]:
+            missing_by_id.setdefault(str(conversation["id"]), conversation)
+    missing = list(missing_by_id.values())
     backup_dir = backup_sqlite_files(codex_home, db_path)
     if not missing:
-        return {"inserted": 0, "backupDir": backup_dir, "ids": []}
+        return {"inserted": 0, "skipped": 0, "backupDir": backup_dir, "ids": [], "skippedIds": []}
 
     with closing(sqlite_connect(db_path)) as conn:
         columns = table_columns(conn, "threads")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for conversation in missing:
+            # The status screen is only a snapshot. Re-check after taking the
+            # write lock so a concurrent update cannot cause a duplicate-ID
+            # failure, and so stale state from an earlier scan is harmless.
+            existing_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM threads")}
+            skipped_ids = sorted(
+                str(conversation["id"])
+                for conversation in missing
+                if str(conversation["id"]) in existing_ids
+            )
+            pending = [
+                conversation
+                for conversation in missing
+                if str(conversation["id"]) not in existing_ids
+            ]
+            inserted_ids: list[str] = []
+            for conversation in pending:
                 row = {
                     key: value
                     for key, value in build_insert_row(conversation, target_provider).items()
@@ -1466,15 +1513,18 @@ def backfill_missing_threads(codex_home: Path) -> dict[str, Any]:
                     f"INSERT INTO threads ({', '.join(names)}) VALUES ({placeholders})",
                     row,
                 )
+                inserted_ids.append(str(conversation["id"]))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
     return {
-        "inserted": len(missing),
+        "inserted": len(inserted_ids),
+        "skipped": len(skipped_ids),
         "backupDir": backup_dir,
-        "ids": [conversation["id"] for conversation in missing],
+        "ids": inserted_ids,
+        "skippedIds": skipped_ids,
     }
 
 
@@ -1485,6 +1535,8 @@ def backfill(codex_home: Path) -> None:
     print(f"新增 SQLite threads：{result['inserted']} 条")
     if result["ids"]:
         print(f"新增 ID：{'，'.join(result['ids'])}")
+    if result.get("skippedIds"):
+        print(f"已跳过数据库中已经存在的重复 ID：{'，'.join(result['skippedIds'])}")
 
 
 def create_sqlite_cleanup_backup(
