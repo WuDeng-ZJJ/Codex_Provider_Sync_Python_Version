@@ -1,0 +1,5 @@
+# Windows command scripts must keep their committed CRLF bytes. Using -text
+# also protects GitHub Raw and Download ZIP, which otherwise expose LF blobs.
+*.bat -text
+*.cmd -text
+
