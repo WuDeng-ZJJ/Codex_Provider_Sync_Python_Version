@@ -35,16 +35,33 @@ def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def normalize_windows_path(path: Path) -> Path:
+    """Use the same spelling for ordinary and extended DOS/UNC paths."""
+    value = str(path)
+    if os.name == "nt":
+        value = value.replace("/", "\\")
+        if value[:8].lower() == "\\\\?\\unc\\":
+            value = "\\\\" + value[8:]
+        elif value.startswith("\\\\?\\"):
+            if not re.match(r"^[A-Za-z]:\\", value[4:]):
+                raise RuntimeError(f"不支持的 Windows 设备路径：{path}")
+            value = value[4:]
+        elif value.startswith("\\\\.\\"):
+            raise RuntimeError(f"不支持的 Windows 设备路径：{path}")
+    return Path(value)
+
+
 def safe_path(home: Path, path: Path) -> Path:
     # Reject junctions and symlinks, even when they point back inside the home.
-    absolute = path.absolute()
+    home = normalize_windows_path(home).absolute()
+    absolute = normalize_windows_path(path).absolute()
     absolute.relative_to(home)
     for component in [absolute, *absolute.parents]:
         if component == home:
             break
         if component.is_symlink() or (hasattr(component, "is_junction") and component.is_junction()):
             raise RuntimeError(f"路径包含链接，不能安全删除：{path}")
-    resolved = absolute.resolve()
+    resolved = normalize_windows_path(absolute.resolve())
     resolved.relative_to(home)
     if resolved == home:
         raise RuntimeError("拒绝操作整个数据目录。")
@@ -204,7 +221,7 @@ def history_preview(c, identifier):
 
 
 def build_plan(home: Path, identifier: str, allow_missing: bool = False):
-    home = home.resolve()
+    home = normalize_windows_path(normalize_windows_path(home).resolve())
     files, databases, previews, titles = {}, {}, [], []
     found = False
     for path in data_files(home):
@@ -234,7 +251,7 @@ def build_plan(home: Path, identifier: str, allow_missing: bool = False):
                                     rollout = Path(item["rollout_path"])
                                     # Never trust a stale database pointer as deletion authority.
                                     if rollout.exists():
-                                        safe_path(home, rollout)
+                                        rollout = safe_path(home, rollout)
                                         with rollout.open(encoding="utf-8-sig") as handle:
                                             meta = json.loads(handle.readline())
                                         if meta.get("type") != "session_meta" or meta.get("payload", {}).get("id") != identifier:
