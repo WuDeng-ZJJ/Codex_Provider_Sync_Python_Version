@@ -7,20 +7,12 @@ import re
 import shutil
 import sqlite3
 import sys
+import tomllib
 from collections import Counter
 from contextlib import closing, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10: use the compatible backport when available.
-    try:
-        import tomli as tomllib
-    except ModuleNotFoundError:
-        tomllib = None
-
 
 DEFAULT_PROVIDER = "openai"
 SESSION_DIRS = ("sessions", "archived_sessions")
@@ -162,8 +154,6 @@ def read_config_text(codex_home: Path) -> str:
 
 
 def read_current_provider_from_config_text(config_text: str) -> tuple[str, bool]:
-    if tomllib is None:
-        raise RuntimeError("需要 Python 3.11+ 或 tomli，才能准确解析 provider 配置。")
     config = tomllib.loads(config_text)
     profile_name = config.get("profile")
     profile = config.get("profiles", {}).get(profile_name, {}) if profile_name else {}
@@ -179,31 +169,19 @@ def read_current_provider_from_config_text(config_text: str) -> tuple[str, bool]
 
 def list_configured_provider_ids(config_text: str) -> list[str]:
     providers = {DEFAULT_PROVIDER}
-    if tomllib is not None:
-        try:
-            config = tomllib.loads(config_text)
-            configured = config.get("model_providers")
-            if isinstance(configured, dict):
-                providers.update(str(provider) for provider in configured)
-            return sorted(providers)
-        except (tomllib.TOMLDecodeError, ValueError):
-            pass
+    try:
+        config = tomllib.loads(config_text)
+        configured = config.get("model_providers")
+        if isinstance(configured, dict):
+            providers.update(str(provider) for provider in configured)
+        return sorted(providers)
+    except (tomllib.TOMLDecodeError, ValueError):
+        pass
     providers.update(re.findall(r"^\[model_providers\.([A-Za-z0-9_.-]+)]\s*$", config_text, flags=re.M))
     return sorted(providers)
 
 
 def provider_config_error(config_text: str) -> str | None:
-    if tomllib is None:
-        current_provider, _ = read_current_provider_from_config_text(config_text)
-        if current_provider == DEFAULT_PROVIDER:
-            return None
-        section_pattern = rf"^\[model_providers\.{re.escape(current_provider)}\]\s*$"
-        if re.search(section_pattern, config_text, flags=re.M):
-            return None
-        return (
-            "当前 Python 缺少 TOML 解析器，且 config.toml 没有找到当前 provider。"
-            "请使用 Python 3.11+，或安装 tomli 后重新运行。"
-        )
     try:
         config = tomllib.loads(config_text)
     except tomllib.TOMLDecodeError as error:
@@ -464,7 +442,8 @@ def to_desktop_workspace_path(value: Any) -> Any:
     match = re.match(r"^\\\\\?\\([A-Za-z]:)(?:[\\/](.*))?$", trimmed)
     if match:
         drive, rest = match.groups()
-        return f"{drive}\\{rest.replace('/', '\\')}" if rest else f"{drive}\\"
+        normalized_rest = rest.replace("/", "\\") if rest else ""
+        return f"{drive}\\{normalized_rest}" if normalized_rest else f"{drive}\\"
     if trimmed.startswith("\\\\?\\"):
         return trimmed[4:].replace("/", "\\")
     return value

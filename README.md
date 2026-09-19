@@ -114,7 +114,7 @@ All launchers call the same Python program. The Windows launcher first calls `cl
 
 ## Requirements / 环境要求
 
-- Python 3.10+ recommended
+- Python 3.11 or newer (required; only the Python standard library is used)
 - Codex Desktop local data available
 - Newer Codex layout expected:
 
@@ -150,7 +150,7 @@ Double-click:
 同步恢复对话.bat
 ```
 
-The Windows launcher verifies its helper and Python first, closes Codex Desktop, and then starts the existing interactive workflow.
+The Windows launcher verifies its helpers, Codex data directory, and a working Python 3.11+ runtime before it closes Codex Desktop. It skips broken Windows Store aliases, prints the selected interpreter, and preserves the real Python exit code when a run fails.
 
 or run:
 

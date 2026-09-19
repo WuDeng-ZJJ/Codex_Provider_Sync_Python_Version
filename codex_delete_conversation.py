@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import tomllib
 from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -315,7 +316,6 @@ def build_plan(home: Path, identifier: str, allow_missing: bool = False):
         elif name == identifier + ".lock" and path.parent == home / "thread-writer-locks":
             files[path] = (path.read_bytes(), None)
         elif name == "automation.toml":
-            import tomllib
             before = path.read_bytes()
             config = tomllib.loads(before.decode("utf-8-sig"))
             if config.get("target_thread_id") == identifier and config.get("kind") == "heartbeat":
