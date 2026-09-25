@@ -132,6 +132,8 @@ All launchers call the same Python program. The Windows launcher first calls `cl
 
 选择 `A` 时只接受本机 Codex 线程深度链接，不接受分享链接、远程链接或模糊标题匹配。会话文件、历史索引、目标/队列/日志等本地数据库中按已识别字段保存的该完整线程 ID 关联会按字段处理；无法确认归属的内容、其他线程、远程主机记录和项目文件不会删除。删除成功后不会保留该对话的临时恢复副本。
 
+Codex 原子写入产生的 `..codex-global-state.json.tmp-*` 临时文件可能是零字节或截断的 JSON，不属于正式状态；按链接删除时会跳过这些临时文件，只处理正式状态文件及其 `.bak` 备份。
+
 批处理流程结束时还会询问“是否打开 ChatGPT？N：不打开，其余键或直接回车：打开”。输入 `N` 或 `n` 不打开，其他输入（包括直接回车）启动本机 ChatGPT 应用。
 
 ## Quick Start / 快速开始

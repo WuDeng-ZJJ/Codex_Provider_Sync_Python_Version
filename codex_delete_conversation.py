@@ -16,6 +16,9 @@ from urllib.parse import urlsplit, unquote
 from uuid import UUID
 
 
+DESKTOP_STATE_FILES = {".codex-global-state.json", ".codex-global-state.json.bak"}
+
+
 def parse_link(value: str) -> str:
     link = urlsplit(value.strip())
     if link.scheme.lower() != "codex" or link.netloc.lower() != "threads" or link.query or link.fragment:
@@ -293,7 +296,12 @@ def build_plan(home: Path, identifier: str, allow_missing: bool = False):
             after = b"".join(kept)
             if after != before:
                 files[path] = (before, after)
-        elif ".codex-global-state.json" in name:
+        # Codex writes atomic replacement files such as
+        # ``..codex-global-state.json.tmp-*``.  They can be zero-byte or
+        # deliberately truncated while the desktop is running, so they are
+        # not authoritative state and must never make an exact-ID deletion
+        # fail.  Only the live state file and its explicit backup are edited.
+        elif name in DESKTOP_STATE_FILES:
             before = path.read_bytes()
             try:
                 obj = json.loads(before)
