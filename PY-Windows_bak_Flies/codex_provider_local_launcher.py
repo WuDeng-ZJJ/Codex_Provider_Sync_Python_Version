@@ -1,0 +1,2075 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tomllib
+from collections import Counter
+from contextlib import closing, ExitStack
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+DEFAULT_PROVIDER = "openai"
+SESSION_DIRS = ("sessions", "archived_sessions")
+DB_FILE_BASENAME = "state_5.sqlite"
+SQLITE_DIR_BASENAME = "sqlite"
+CATALOG_DB_BASENAME = "codex-dev.db"
+PROVIDER_BACKUP_NAMESPACE = "provider-sync"
+CONVERSATION_BACKUP_NAMESPACE = "py-provider-sync"
+DB_CLEANUP_BACKUP_NAMESPACE = "manual-db-cleanup"
+PROVIDER_CONFIG_RECOVERY_NAMESPACE = "provider-config-recovery"
+
+
+def default_codex_home() -> Path:
+    return Path.home() / ".codex"
+
+
+def normalize_codex_home(value: str | None) -> Path:
+    return Path(value or os.environ.get("CODEX_HOME") or default_codex_home()).expanduser().resolve()
+
+
+def provider_backup_root(codex_home: Path) -> Path:
+    return codex_home / "backups_state" / PROVIDER_BACKUP_NAMESPACE
+
+
+def conversation_backup_root(codex_home: Path) -> Path:
+    return codex_home / "backups_state" / CONVERSATION_BACKUP_NAMESPACE
+
+
+def database_cleanup_backup_root(codex_home: Path) -> Path:
+    return codex_home / "backups_state" / DB_CLEANUP_BACKUP_NAMESPACE
+
+
+def provider_config_recovery_root(codex_home: Path) -> Path:
+    return codex_home / "backups_state" / PROVIDER_CONFIG_RECOVERY_NAMESPACE
+
+
+def timestamp_for_path() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def unique_timestamp_dir(root: Path) -> Path:
+    base = timestamp_for_path()
+    candidate = root / base
+    if not candidate.exists():
+        return candidate
+    for index in range(1, 100):
+        candidate = root / f"{base}-{index:02d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法创建唯一备份目录：{root}")
+
+
+def clean_text(value: Any, fallback: str = "未命名") -> str:
+    text = re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+    return text or fallback
+
+
+def parse_time_ms(value: Any) -> int:
+    if not value:
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        return int(datetime.fromisoformat(text).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def to_unix_seconds(value: Any) -> int:
+    ms = parse_time_ms(value)
+    return int(ms / 1000) if ms else int(datetime.now(tz=timezone.utc).timestamp())
+
+
+def to_unix_ms(value: Any) -> int:
+    ms = parse_time_ms(value)
+    return ms if ms else int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+
+def char_width(char: str) -> int:
+    code = ord(char)
+    return 2 if (
+        0x1100 <= code <= 0x115F
+        or code in (0x2329, 0x232A)
+        or 0x2E80 <= code <= 0xA4CF
+        or 0xAC00 <= code <= 0xD7A3
+        or 0xF900 <= code <= 0xFAFF
+        or 0xFE10 <= code <= 0xFE19
+        or 0xFE30 <= code <= 0xFE6F
+        or 0xFF00 <= code <= 0xFF60
+        or 0xFFE0 <= code <= 0xFFE6
+    ) else 1
+
+
+def display_width(value: Any) -> int:
+    return sum(char_width(char) for char in str(value if value is not None else ""))
+
+
+def shorten(value: Any, max_width: int) -> str:
+    text = clean_text(value, "")
+    if display_width(text) <= max_width:
+        return text
+    result = ""
+    width = 0
+    for char in text:
+        next_width = char_width(char)
+        if width + next_width > max_width - 1:
+            break
+        result += char
+        width += next_width
+    return f"{result}…"
+
+
+def pad_display(value: Any, width: int) -> str:
+    text = str(value if value is not None else "")
+    return text + (" " * max(0, width - display_width(text)))
+
+
+def sum_counts(counts: dict[str, int] | None) -> int:
+    return sum(int(value or 0) for value in (counts or {}).values())
+
+
+def format_counts(counts: dict[str, int] | None) -> str:
+    if not counts:
+        return "无"
+    return "，".join(f"{provider} {count} 条" for provider, count in counts.items())
+
+
+def count_hidden(counts: dict[str, int], current_provider: str | None) -> int:
+    return sum(int(count or 0) for provider, count in counts.items() if provider != current_provider)
+
+
+def read_config_text(codex_home: Path) -> str:
+    return (codex_home / "config.toml").read_text(encoding="utf-8")
+
+
+def read_current_provider_from_config_text(config_text: str) -> tuple[str, bool]:
+    config = tomllib.loads(config_text)
+    profile_name = config.get("profile")
+    profile = config.get("profiles", {}).get(profile_name, {}) if profile_name else {}
+    if profile_name and not isinstance(profile, dict):
+        raise RuntimeError("当前 profile 配置无效。")
+    if profile_name and profile_name not in config.get("profiles", {}):
+        raise RuntimeError("config.toml 指定的 profile 不存在。")
+    provider = profile.get("model_provider", config.get("model_provider", DEFAULT_PROVIDER))
+    if not isinstance(provider, str) or not provider.strip():
+        raise RuntimeError("model_provider 必须是非空字符串。")
+    return provider, "model_provider" not in profile and "model_provider" not in config
+
+
+def list_configured_provider_ids(config_text: str) -> list[str]:
+    providers = {DEFAULT_PROVIDER}
+    try:
+        config = tomllib.loads(config_text)
+        configured = config.get("model_providers")
+        if isinstance(configured, dict):
+            providers.update(str(provider) for provider in configured)
+        return sorted(providers)
+    except (tomllib.TOMLDecodeError, ValueError):
+        pass
+    providers.update(re.findall(r"^\[model_providers\.([A-Za-z0-9_.-]+)]\s*$", config_text, flags=re.M))
+    return sorted(providers)
+
+
+def provider_config_error(config_text: str) -> str | None:
+    try:
+        config = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError as error:
+        return f"config.toml 不是有效的 TOML：{error}"
+
+    current_provider, _ = read_current_provider_from_config_text(config_text)
+    if not isinstance(current_provider, str) or not current_provider.strip():
+        return "config.toml 的 model_provider 不是有效的字符串"
+    if current_provider == DEFAULT_PROVIDER:
+        return None
+
+    providers = config.get("model_providers")
+    if isinstance(providers, dict) and isinstance(providers.get(current_provider), dict):
+        return None
+    return (
+        f"config.toml 当前使用的 model provider '{current_provider}' 没有对应的 "
+        f"[model_providers.{current_provider}] 配置。"
+    )
+
+
+def validate_provider_config(config_text: str) -> tuple[str, bool]:
+    error = provider_config_error(config_text)
+    if error:
+        raise RuntimeError(
+            f"{error} 已停止写入，避免恢复后出现 Model provider not found。"
+            "请先补全 config.toml，或改为已配置的 provider 后重新运行。"
+        )
+    return read_current_provider_from_config_text(config_text)
+
+
+def load_operation_provider_config(codex_home: Path) -> tuple[str, str, bool]:
+    # Never restore an old relay endpoint merely to make its provider ID exist.
+    config_text = read_config_text(codex_home)
+    current_provider, _ = validate_provider_config(config_text)
+    return config_text, current_provider, False
+
+
+def validate_config_snapshot(
+    codex_home: Path,
+    expected_text: str,
+    expected_provider: str,
+) -> None:
+    current_text = read_config_text(codex_home)
+    current_provider, _ = validate_provider_config(current_text)
+    if current_text != expected_text or current_provider != expected_provider:
+        raise RuntimeError(
+            "config.toml 在维护过程中发生变化，已停止写入，请确认配置完整后重新运行。"
+        )
+
+
+def extract_provider_table(config_text: str, provider: str) -> str | None:
+    header_pattern = re.compile(
+        rf"^\[model_providers\.{re.escape(provider)}\]\s*(?:#.*)?$",
+        flags=re.M,
+    )
+    match = header_pattern.search(config_text)
+    if not match:
+        return None
+
+    start = match.start()
+    next_table = re.search(r"^\[[^\r\n]+\]\s*(?:#.*)?$", config_text[match.end():], flags=re.M)
+    end = match.end() + next_table.start() if next_table else len(config_text)
+    return config_text[start:end].strip()
+
+
+def merge_provider_config(current_text: str, source_text: str, provider: str) -> tuple[str, str]:
+    provider_table = extract_provider_table(source_text, provider)
+    if not provider_table:
+        raise RuntimeError(f"历史配置中缺少 [model_providers.{provider}] 配置。")
+
+    merged_text = f"{current_text.rstrip()}\n\n{provider_table}\n"
+    if provider_config_error(merged_text) is not None:
+        raise RuntimeError("历史 provider 配置无法合并到当前 config.toml。")
+    return merged_text, "provider-table"
+
+
+def recover_provider_config(codex_home: Path) -> dict[str, Any]:
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        raise RuntimeError(f"找不到 config.toml：{config_path}")
+
+    current_text = config_path.read_text(encoding="utf-8")
+    error = provider_config_error(current_text)
+    if error is None:
+        current_provider, _ = read_current_provider_from_config_text(current_text)
+        return {"recovered": False, "provider": current_provider, "source": None}
+
+    current_provider, _ = read_current_provider_from_config_text(current_text)
+    backup_root = provider_backup_root(codex_home)
+    candidates = sorted(
+        backup_root.rglob("config.toml") if backup_root.exists() else [],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    source_path = None
+    source_text = None
+    for candidate in candidates:
+        try:
+            candidate_text = candidate.read_text(encoding="utf-8")
+            candidate_provider, _ = read_current_provider_from_config_text(candidate_text)
+        except (OSError, UnicodeError):
+            continue
+        if candidate_provider == current_provider and provider_config_error(candidate_text) is None:
+            source_path = candidate
+            source_text = candidate_text
+            break
+
+    if source_path is None or source_text is None:
+        raise RuntimeError(
+            f"{error} 未找到同名且完整的历史配置备份，已停止操作，未修改 config.toml。"
+        )
+
+    recovery_dir = unique_timestamp_dir(provider_config_recovery_root(codex_home))
+    recovery_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(config_path, recovery_dir / "config.toml.before")
+    shutil.copy2(source_path, recovery_dir / "config.toml.source")
+    (recovery_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "provider": current_provider,
+                "source": str(source_path),
+                "mode": "pending",
+                "recoveredAt": datetime.now(tz=timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    replacement_text = source_text
+    recovery_mode = "full-config"
+    try:
+        replacement_text, recovery_mode = merge_provider_config(
+            current_text,
+            source_text,
+            current_provider,
+        )
+    except (RuntimeError, ValueError):
+        # A malformed current TOML cannot be merged reliably, so use the validated source backup.
+        pass
+
+    manifest_path = recovery_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["mode"] = recovery_mode
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    temporary_path = config_path.with_name(f"{config_path.name}.recovery.{os.getpid()}.tmp")
+    try:
+        temporary_path.write_text(replacement_text, encoding="utf-8")
+        os.replace(temporary_path, config_path)
+        validate_provider_config(read_config_text(codex_home))
+    except Exception:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+        restore_path = config_path.with_name(f"{config_path.name}.restore.{os.getpid()}.tmp")
+        restore_path.write_text(current_text, encoding="utf-8")
+        os.replace(restore_path, config_path)
+        raise
+
+    return {
+        "recovered": True,
+        "provider": current_provider,
+        "source": source_path,
+        "mode": recovery_mode,
+    }
+
+
+def read_first_line_record(file_path: Path) -> tuple[str, bytes, bytes, bytes]:
+    data = file_path.read_bytes()
+    newline_index = data.find(b"\n")
+    if newline_index < 0:
+        return data.decode("utf-8"), b"", b"", data
+    if newline_index > 0 and data[newline_index - 1:newline_index] == b"\r":
+        first_bytes = data[: newline_index - 1]
+        separator = b"\r\n"
+    else:
+        first_bytes = data[:newline_index]
+        separator = b"\n"
+    rest = data[newline_index + 1:]
+    return first_bytes.decode("utf-8"), separator, rest, data
+
+
+def parse_session_meta(first_line: str) -> dict[str, Any] | None:
+    if not first_line:
+        return None
+    try:
+        record = json.loads(first_line)
+    except json.JSONDecodeError:
+        return None
+    if record.get("type") != "session_meta" or not isinstance(record.get("payload"), dict):
+        return None
+    return record
+
+
+def is_subagent_payload(payload: dict[str, Any]) -> bool:
+    if payload.get("thread_source") == "subagent":
+        return True
+    source = payload.get("source")
+    return isinstance(source, dict) and isinstance(source.get("subagent"), dict)
+
+
+def list_rollout_files(root_dir: Path) -> list[Path]:
+    if not root_dir.exists():
+        return []
+    return sorted(path for path in root_dir.rglob("rollout-*.jsonl") if path.is_file())
+
+
+def record_has_user_event(record: dict[str, Any]) -> bool:
+    if record.get("type") == "event_msg" and (record.get("payload") or {}).get("type") == "user_message":
+        return True
+    for key in ("payload", "item", "msg"):
+        value = record.get(key)
+        if isinstance(value, dict) and value.get("type") == "message" and value.get("role") == "user":
+            return True
+    return False
+
+
+def file_has_user_event(file_path: Path) -> bool:
+    try:
+        with file_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    if record_has_user_event(json.loads(line)):
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return False
+    return False
+
+
+def file_has_encrypted_content(file_path: Path) -> bool:
+    try:
+        with file_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if '"encrypted_content"' in line:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def to_desktop_workspace_path(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    trimmed = value.strip()
+    if not trimmed:
+        return value
+    match = re.match(r"^\\\\\?\\UNC\\(.+)$", trimmed, flags=re.I)
+    if match:
+        return ("\\\\" + match.group(1)).replace("/", "\\")
+    match = re.match(r"^\\\\\?\\([A-Za-z]:)(?:[\\/](.*))?$", trimmed)
+    if match:
+        drive, rest = match.groups()
+        normalized_rest = rest.replace("/", "\\") if rest else ""
+        return f"{drive}\\{normalized_rest}" if normalized_rest else f"{drive}\\"
+    if trimmed.startswith("\\\\?\\"):
+        return trimmed[4:].replace("/", "\\")
+    return value
+
+
+def normalize_comparable_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    match = re.match(r"^\\\\\?\\UNC\\(.+)$", normalized, flags=re.I)
+    normalized = "\\\\" + match.group(1) if match else re.sub(r"^\\\\\?\\", "", normalized)
+    normalized = normalized.replace("/", "\\").rstrip("\\")
+    if re.match(r"^[A-Za-z]:$", normalized):
+        normalized += "\\"
+    return normalized.lower()
+
+
+def collect_rollout_status(codex_home: Path, target_provider: str | None = None) -> dict[str, Any]:
+    provider_counts = {name: Counter() for name in SESSION_DIRS}
+    subagent_counts = {name: Counter() for name in SESSION_DIRS}
+    encrypted_counts = {name: Counter() for name in SESSION_DIRS}
+    user_event_thread_ids: set[str] = set()
+    thread_cwd_by_id: dict[str, str] = {}
+    changes: list[dict[str, Any]] = []
+    locked_paths: list[str] = []
+
+    for dir_name in SESSION_DIRS:
+        root_dir = codex_home / dir_name
+        for rollout_path in list_rollout_files(root_dir):
+            try:
+                first_line, separator, rest, original_data = read_first_line_record(rollout_path)
+            except OSError:
+                locked_paths.append(str(rollout_path))
+                continue
+            record = parse_session_meta(first_line)
+            if not record:
+                continue
+            payload = record["payload"]
+            provider = payload.get("model_provider", "(missing)")
+            counts = subagent_counts if is_subagent_payload(payload) else provider_counts
+            counts[dir_name][provider] += 1
+            thread_id = payload.get("id")
+            cwd = payload.get("cwd")
+            if isinstance(thread_id, str) and thread_id and isinstance(cwd, str) and cwd.strip():
+                thread_cwd_by_id[thread_id] = to_desktop_workspace_path(cwd)
+            if file_has_encrypted_content(rollout_path):
+                encrypted_counts[dir_name][provider] += 1
+            if isinstance(thread_id, str) and thread_id and file_has_user_event(rollout_path):
+                user_event_thread_ids.add(thread_id)
+            if target_provider is not None and target_provider != "__status_only__" and payload.get("model_provider") != target_provider:
+                next_record = json.loads(json.dumps(record))
+                next_record["payload"]["model_provider"] = target_provider
+                stat = rollout_path.stat()
+                changes.append({
+                    "path": rollout_path,
+                    "thread_id": thread_id,
+                    "directory": dir_name,
+                    "original_first_line": first_line,
+                    "separator": separator,
+                    "rest": rest,
+                    "original_data": original_data,
+                    "mtime": stat.st_mtime,
+                    "updated_first_line": json.dumps(next_record, ensure_ascii=False, separators=(",", ":")),
+                    "original_provider": provider,
+                })
+
+    return {
+        "provider_counts": {key: dict(value) for key, value in provider_counts.items()},
+        "subagent_counts": {key: dict(value) for key, value in subagent_counts.items()},
+        "encrypted_counts": {key: dict(value) for key, value in encrypted_counts.items()},
+        "user_event_thread_ids": user_event_thread_ids,
+        "thread_cwd_by_id": thread_cwd_by_id,
+        "changes": changes,
+        "locked_paths": locked_paths,
+    }
+
+
+def state_db_candidates(codex_home: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": codex_home / SQLITE_DIR_BASENAME / DB_FILE_BASENAME,
+            "relative_path": str(Path(SQLITE_DIR_BASENAME) / DB_FILE_BASENAME),
+            "source": "sqlite-dir",
+        },
+        {
+            "path": codex_home / DB_FILE_BASENAME,
+            "relative_path": DB_FILE_BASENAME,
+            "source": "legacy-root",
+        },
+    ]
+
+
+def detect_state_db(codex_home: Path) -> dict[str, Any] | None:
+    for candidate in state_db_candidates(codex_home):
+        if candidate["path"].exists():
+            return candidate
+    return None
+
+
+def existing_state_db_path(codex_home: Path) -> Path | None:
+    detected = detect_state_db(codex_home)
+    return detected["path"] if detected else None
+
+
+def existing_catalog_db_path(codex_home: Path) -> Path | None:
+    path = codex_home / SQLITE_DIR_BASENAME / CATALOG_DB_BASENAME
+    return path if path.exists() else None
+
+
+def sqlite_connect(db_path: Path, read_only: bool = False) -> sqlite3.Connection:
+    if read_only:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+    else:
+        conn = sqlite3.connect(db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+
+
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def rollout_path_exists(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and Path(value).is_file()
+
+
+def stale_sqlite_thread_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    columns = table_columns(conn, "threads")
+    if "id" not in columns or "rollout_path" not in columns:
+        raise RuntimeError("SQLite threads 表缺少 id 或 rollout_path，无法安全识别异常记录。")
+    return [
+        dict(row)
+        for row in conn.execute("SELECT * FROM threads ORDER BY updated_at DESC")
+        if not rollout_path_exists(row["rollout_path"])
+    ]
+
+
+def read_stale_sqlite_threads(codex_home: Path) -> list[dict[str, Any]]:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return []
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
+        return stale_sqlite_thread_rows(conn)
+
+
+def read_sqlite_provider_counts(codex_home: Path) -> dict[str, Any] | None:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return None
+    try:
+        with closing(sqlite_connect(db_path, read_only=True)) as conn:
+            columns = table_columns(conn, "threads")
+            if "model_provider" not in columns:
+                return {"sessions": {}, "archived_sessions": {}}
+            archived_expression = "archived" if "archived" in columns else "0 AS archived"
+            rows = conn.execute(f"""
+                SELECT
+                  CASE
+                    WHEN model_provider IS NULL OR model_provider = '' THEN '(missing)'
+                    ELSE model_provider
+                  END AS model_provider,
+                  {archived_expression},
+                  COUNT(*) AS count
+                FROM threads
+                GROUP BY model_provider, archived
+                ORDER BY archived, model_provider
+            """).fetchall()
+            result = {"sessions": {}, "archived_sessions": {}}
+            for row in rows:
+                bucket = result["archived_sessions"] if row["archived"] else result["sessions"]
+                bucket[row["model_provider"]] = int(row["count"])
+            return result
+    except sqlite3.Error as error:
+        message = str(error).lower()
+        if "malformed" in message or "not a database" in message or "database is locked" in message:
+            return {
+                "sessions": {},
+                "archived_sessions": {},
+                "unreadable": True,
+                "error": "state_5.sqlite is currently in use" if "locked" in message else "state_5.sqlite is malformed or unreadable",
+            }
+        raise
+
+
+def read_sqlite_repair_stats(
+    codex_home: Path,
+    user_event_thread_ids: set[str],
+    thread_cwd_by_id: dict[str, str],
+) -> dict[str, int] | None:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return None
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
+        columns = table_columns(conn, "threads")
+        user_event_rows = 0
+        if "has_user_event" in columns and user_event_thread_ids:
+            for thread_id in user_event_thread_ids:
+                row = conn.execute("SELECT has_user_event FROM threads WHERE id = ?", (thread_id,)).fetchone()
+                if row and int(row["has_user_event"] or 0) != 1:
+                    user_event_rows += 1
+
+        cwd_rows = 0
+        if "cwd" in columns and thread_cwd_by_id:
+            for thread_id, cwd in thread_cwd_by_id.items():
+                if not thread_id or not cwd.strip():
+                    continue
+                row = conn.execute("SELECT cwd FROM threads WHERE id = ?", (thread_id,)).fetchone()
+                if row and row["cwd"] != cwd:
+                    cwd_rows += 1
+        return {"userEventRowsNeedingRepair": user_event_rows, "cwdRowsNeedingRepair": cwd_rows}
+
+
+def read_sqlite_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return {}
+    try:
+        with closing(sqlite_connect(db_path, read_only=True)) as conn:
+            columns = table_columns(conn, "threads")
+            wanted = ["id", "title", "model_provider", "archived", "cwd"]
+            selected = [column for column in wanted if column in columns]
+            if "id" not in selected:
+                return {}
+            rows = conn.execute(f"SELECT {', '.join(selected)} FROM threads").fetchall()
+            return {row["id"]: dict(row) for row in rows}
+    except sqlite3.Error:
+        return {}
+
+
+def read_rollout_sessions(codex_home: Path) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    for file_path in list_rollout_files(codex_home / "sessions"):
+        try:
+            first_line, _, _, _ = read_first_line_record(file_path)
+        except OSError:
+            continue
+        record = parse_session_meta(first_line)
+        if not record:
+            continue
+        payload = record["payload"]
+        sessions.append({
+            "id": payload.get("id") or payload.get("session_id") or file_path.stem.removeprefix("rollout-"),
+            "provider": payload.get("model_provider", "(missing)"),
+            "cwd": payload.get("cwd", ""),
+            "timestamp": payload.get("timestamp") or record.get("timestamp") or "",
+            "source": payload.get("source") or "vscode",
+            "thread_source": payload.get("thread_source") or "user",
+            "is_subagent": is_subagent_payload(payload),
+            "cli_version": payload.get("cli_version") or "",
+            "has_user_event": file_has_user_event(file_path),
+            "file_path": file_path,
+        })
+    return sessions
+
+
+def deduplicate_rollout_sessions(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the newest rollout file for each top-level or subagent thread ID.
+
+    A single Codex thread can have several rollout files after multiple turns or
+    forks.  ``threads.id`` is unique, so treating every file as a new thread
+    makes backfill attempt duplicate inserts.
+    """
+    newest: dict[tuple[bool, str], dict[str, Any]] = {}
+    for session in sessions:
+        thread_id = str(session.get("id") or "").strip()
+        if not thread_id:
+            continue
+        key = (bool(session.get("is_subagent")), thread_id)
+        previous = newest.get(key)
+        if previous is None:
+            newest[key] = session
+            continue
+        current_key = (parse_time_ms(session.get("timestamp")), str(session.get("file_path", "")))
+        previous_key = (parse_time_ms(previous.get("timestamp")), str(previous.get("file_path", "")))
+        if current_key > previous_key:
+            newest[key] = session
+    return list(newest.values())
+
+
+def read_session_index_names(codex_home: Path) -> dict[str, dict[str, str]]:
+    index_path = codex_home / "session_index.jsonl"
+    names: dict[str, dict[str, str]] = {}
+    if not index_path.exists():
+        return names
+    with index_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            thread_id = item.get("id")
+            if not thread_id:
+                continue
+            previous = names.get(thread_id)
+            if previous is None or parse_time_ms(item.get("updated_at")) >= parse_time_ms(previous.get("updated_at")):
+                names[thread_id] = {
+                    "name": item.get("thread_name") or "",
+                    "updated_at": item.get("updated_at") or "",
+                }
+    return names
+
+
+def build_conversation_details(codex_home: Path) -> list[dict[str, Any]]:
+    rollouts = deduplicate_rollout_sessions(read_rollout_sessions(codex_home))
+    index_names = read_session_index_names(codex_home)
+    sqlite_rows = read_sqlite_thread_rows(codex_home)
+    details: list[dict[str, Any]] = []
+    for session in rollouts:
+        if session.get("is_subagent"):
+            continue
+        thread_id = str(session["id"])
+        index_name = (index_names.get(thread_id) or {}).get("name")
+        sqlite_row = sqlite_rows.get(thread_id)
+        detail = dict(session)
+        detail.update({
+            "name": clean_text(index_name or (sqlite_row or {}).get("title") or thread_id),
+            "sqlite_title": clean_text((sqlite_row or {}).get("title"), "") if sqlite_row else "",
+            "in_sqlite": sqlite_row is not None,
+            "archived": "是" if sqlite_row and sqlite_row.get("archived") else "否",
+            "index_updated_at": (index_names.get(thread_id) or {}).get("updated_at", ""),
+        })
+        details.append(detail)
+    details.sort(key=lambda item: parse_time_ms(item.get("index_updated_at") or item.get("timestamp")), reverse=True)
+    return details
+
+
+def to_path_array(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, str) and entry.strip()]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
+def dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in paths:
+        comparable = normalize_comparable_path(value)
+        if not comparable or comparable in seen:
+            continue
+        seen.add(comparable)
+        result.append(value)
+    return result
+
+
+def read_workspace_roots_from_global_state(state: dict[str, Any]) -> list[str]:
+    saved_roots = to_path_array(state.get("electron-saved-workspace-roots"))
+    project_order = to_path_array(state.get("project-order"))
+    active_roots = to_path_array(state.get("active-workspace-roots"))
+    source = [*project_order, *saved_roots, *active_roots] if project_order else [*saved_roots, *active_roots]
+    return dedupe_paths([to_desktop_workspace_path(path) for path in source])
+
+
+def build_time_expression(columns: set[str]) -> str:
+    expressions = []
+    if "updated_at_ms" in columns:
+        expressions.append("updated_at_ms")
+    if "updated_at" in columns:
+        expressions.append("updated_at * 1000")
+    if "created_at_ms" in columns:
+        expressions.append("created_at_ms")
+    if "created_at" in columns:
+        expressions.append("created_at * 1000")
+    expressions.append("0")
+    return f"COALESCE({', '.join(expressions)})"
+
+
+def format_rank_preview(ranks: list[int], max_count: int = 12) -> str:
+    preview = ", ".join(str(rank) for rank in ranks[:max_count])
+    remaining = len(ranks) - min(len(ranks), max_count)
+    return f"{preview} (+{remaining} more)" if remaining > 0 else preview
+
+
+def read_project_thread_visibility(codex_home: Path, page_size: int = 50) -> list[dict[str, Any]]:
+    global_state_path = codex_home / ".codex-global-state.json"
+    if not global_state_path.exists():
+        return []
+    state = json.loads(global_state_path.read_text(encoding="utf-8"))
+    roots = read_workspace_roots_from_global_state(state)
+    if not roots:
+        return []
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return [{
+            "root": root,
+            "interactiveThreads": 0,
+            "firstPageThreads": 0,
+            "exactCwdMatches": 0,
+            "verbatimCwdRows": 0,
+            "ranks": [],
+            "rankPreview": "",
+            "providerCounts": {},
+        } for root in roots]
+
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
+        columns = table_columns(conn, "threads")
+        if "cwd" not in columns:
+            return []
+        source_filter = "AND source IN ('cli', 'vscode')" if "source" in columns else ""
+        archived_filter = "AND archived = 0" if "archived" in columns else ""
+        first_user_filter = "AND first_user_message <> ''" if "first_user_message" in columns else ""
+        provider_expression = "model_provider" if "model_provider" in columns else "'' AS model_provider"
+        time_expression = build_time_expression(columns)
+        rows = conn.execute(f"""
+            SELECT id, cwd, {provider_expression}, {time_expression} AS sort_ts
+            FROM threads
+            WHERE cwd IS NOT NULL AND cwd <> ''
+              {archived_filter}
+              {first_user_filter}
+              {source_filter}
+            ORDER BY sort_ts DESC, id DESC
+        """).fetchall()
+
+    ranked_rows = []
+    for index, row in enumerate(rows, start=1):
+        ranked_rows.append({
+            **dict(row),
+            "rank": index,
+            "normalized_cwd": normalize_comparable_path(row["cwd"]),
+            "desktop_cwd": to_desktop_workspace_path(row["cwd"]),
+        })
+
+    result = []
+    for root in roots:
+        normalized_root = normalize_comparable_path(root)
+        exact_root = to_desktop_workspace_path(root)
+        matching_rows = [row for row in ranked_rows if row["normalized_cwd"] == normalized_root]
+        ranks = [int(row["rank"]) for row in matching_rows]
+        provider_counts: Counter[str] = Counter()
+        exact_cwd_matches = 0
+        verbatim_cwd_rows = 0
+        for row in matching_rows:
+            provider_counts[row.get("model_provider") or "(missing)"] += 1
+            if row.get("cwd") == exact_root:
+                exact_cwd_matches += 1
+            if isinstance(row.get("cwd"), str) and row["cwd"].startswith("\\\\?\\"):
+                verbatim_cwd_rows += 1
+        result.append({
+            "root": exact_root,
+            "interactiveThreads": len(matching_rows),
+            "firstPageThreads": len([rank for rank in ranks if rank <= page_size]),
+            "exactCwdMatches": exact_cwd_matches,
+            "verbatimCwdRows": verbatim_cwd_rows,
+            "topRank": ranks[0] if ranks else None,
+            "ranks": ranks,
+            "rankPreview": format_rank_preview(ranks),
+            "providerCounts": dict(provider_counts),
+        })
+    return result
+
+
+def format_project_visibility(projects: list[dict[str, Any]]) -> str:
+    if not projects:
+        return "无项目可见性诊断"
+    return "\n  ".join(
+        f"{project['root']}：交互 {project['interactiveThreads']} 条，首页 {project['firstPageThreads']}/50，"
+        f"排名 {project.get('rankPreview') or '无'}，精确路径 {project['exactCwdMatches']}/{project['interactiveThreads']}"
+        for project in projects
+    )
+
+
+def get_status(codex_home: Path) -> dict[str, Any]:
+    if not codex_home.exists():
+        raise FileNotFoundError(f"Codex home 不存在：{codex_home}")
+    config_text = read_config_text(codex_home)
+    current_provider, current_provider_implicit = read_current_provider_from_config_text(config_text)
+    configured_providers = list_configured_provider_ids(config_text)
+    config_provider_error = provider_config_error(config_text)
+    rollout = collect_rollout_status(codex_home, "__status_only__")
+    sqlite_counts = read_sqlite_provider_counts(codex_home)
+    sqlite_repair_stats = None
+    if sqlite_counts and not sqlite_counts.get("unreadable"):
+        sqlite_repair_stats = read_sqlite_repair_stats(
+            codex_home,
+            rollout["user_event_thread_ids"],
+            rollout["thread_cwd_by_id"],
+        )
+    project_thread_visibility = [] if sqlite_counts and sqlite_counts.get("unreadable") else read_project_thread_visibility(codex_home)
+    backup_root = provider_backup_root(codex_home)
+    return {
+        "codexHome": str(codex_home),
+        "currentProvider": current_provider,
+        "currentProviderImplicit": current_provider_implicit,
+        "configuredProviders": configured_providers,
+        "configProviderError": config_provider_error,
+        "rolloutCounts": rollout["provider_counts"],
+        "subagentRolloutCounts": rollout["subagent_counts"],
+        "lockedRolloutFiles": rollout["locked_paths"],
+        "encryptedContentCounts": rollout["encrypted_counts"],
+        "sqliteCounts": sqlite_counts,
+        "stateDbLocation": detect_state_db(codex_home),
+        "sqliteRepairStats": sqlite_repair_stats,
+        "projectThreadVisibility": project_thread_visibility,
+        "backupRoot": str(backup_root),
+    }
+
+
+def get_sqlite_session_counts(status: dict[str, Any]) -> dict[str, int]:
+    sqlite_counts = status.get("sqliteCounts")
+    if sqlite_counts and not sqlite_counts.get("unreadable"):
+        return sqlite_counts.get("sessions") or {}
+    return {}
+
+
+def get_repair_total(status: dict[str, Any], hidden_count: int) -> dict[str, int]:
+    repair_stats = status.get("sqliteRepairStats") or {}
+    user_event = int(repair_stats.get("userEventRowsNeedingRepair") or 0)
+    cwd = int(repair_stats.get("cwdRowsNeedingRepair") or 0)
+    return {"userEvent": user_event, "cwd": cwd, "total": hidden_count + user_event + cwd}
+
+
+def print_status(codex_home: Path) -> None:
+    status = get_status(codex_home)
+    conversations = build_conversation_details(codex_home)
+    # The sessions directory may contain several rollout files for one thread.
+    # Use the same unique-thread view as the backfill workflow for the summary.
+    rollout_session_counts = dict(
+        Counter(str(conversation.get("provider") or "(missing)") for conversation in conversations)
+    )
+    subagent_session_counts = status["subagentRolloutCounts"].get("sessions") or {}
+    sqlite_session_counts = get_sqlite_session_counts(status)
+    rollout_total = sum_counts(rollout_session_counts)
+    subagent_total = sum_counts(subagent_session_counts)
+    sqlite_total = sum_counts(sqlite_session_counts)
+    not_in_sqlite = sum(1 for conversation in conversations if not conversation["in_sqlite"])
+    sqlite_without_rollout = len(read_stale_sqlite_threads(codex_home))
+    hidden_threads = count_hidden(rollout_session_counts, status["currentProvider"])
+    repair = get_repair_total(status, hidden_threads)
+    expected_total = repair["total"] + not_in_sqlite
+    sqlite_database = str(status["stateDbLocation"]["path"]) if status.get("stateDbLocation") else "未找到"
+    if status.get("sqliteCounts", {}).get("unreadable"):
+        sqlite_counts_text = f"不可读取：{status['sqliteCounts'].get('error') or '数据库异常'}"
+    else:
+        sqlite_counts_text = (
+            f"数据库 {sqlite_database}；入库对话 {sqlite_total} 条（{format_counts(sqlite_session_counts)}）；"
+            f"未入库对话文件 {not_in_sqlite} 条；无对应对话文件的数据库记录 {sqlite_without_rollout} 条；"
+            f"user-event 待修 {repair['userEvent']} 条；cwd 路径待修 {repair['cwd']} 条"
+        )
+
+    print(f"对话仓库：{status['codexHome']}")
+    print()
+    print(f"本电脑有 {len(status['configuredProviders'])} 个 provider：{'，'.join(status['configuredProviders'])}；当前的 provider 是：{status['currentProvider']}")
+    if status.get("configProviderError"):
+        print(f"配置警告：{status['configProviderError']}")
+    print()
+    print(
+        f"顶层对话记录有 {rollout_total} 条；分别是：{format_counts(rollout_session_counts)}；"
+        f"内部子线程有 {subagent_total} 条（不在 Desktop 侧栏显示）；隐藏的对话有：{hidden_threads} 条"
+    )
+    print()
+    print("对话明细：")
+    for index, conversation in enumerate(conversations, start=1):
+        sqlite_status = "已入库" if conversation["in_sqlite"] else "未入库"
+        id_label = pad_display(f"{index}. ID：{conversation['id']}", 50)
+        name_label = pad_display(f"Desktop 命名：{shorten(conversation['name'], 30)}", 52)
+        cwd_label = pad_display(f"cwd：{shorten(conversation.get('cwd') or '无', 52)}", 58)
+        print(f"  {id_label}{name_label}{cwd_label}（{sqlite_status}）")
+        print()
+    print()
+    print(f"SQLite state：{sqlite_counts_text}")
+    print()
+    print("Project visibility：")
+    print(f"  {format_project_visibility(status['projectThreadVisibility'])}")
+    print()
+    print(f"同步备份在：{status['backupRoot']}")
+    print(f"对话恢复备份在：{conversation_backup_root(codex_home)}")
+    print()
+    print(
+        f"预计恢复/修复的条数：{expected_total} 条（未入库 {not_in_sqlite}，隐藏 {hidden_threads}，"
+        f"user-event {repair['userEvent']}，cwd {repair['cwd']}）"
+    )
+    print()
+    print(
+        f"未入库对话：{not_in_sqlite} 条。输入 B 可将未入库对话写入 SQLite；"
+        f"无对应对话文件的数据库记录：{sqlite_without_rollout} 条，输入 C 可预览并清理。"
+    )
+    print()
+
+
+def copy_directory(source_dir: Path, target_dir: Path) -> None:
+    if target_dir.exists():
+        shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+    else:
+        shutil.copytree(source_dir, target_dir)
+
+
+def list_conversation_backups(codex_home: Path) -> list[dict[str, Any]]:
+    root = conversation_backup_root(codex_home)
+    if not root.exists():
+        return []
+    backups = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        sessions_path = entry / "sessions"
+        if not sessions_path.exists():
+            continue
+        backup = {
+            "name": entry.name,
+            "full_path": entry,
+            "sessions_path": sessions_path,
+            "mtime": entry.stat().st_mtime,
+        }
+        rollout_files = list_backup_rollout_files(backup)
+        backup["count"] = sum(1 for item in rollout_files if not item["is_subagent"])
+        backup["subagent_count"] = sum(1 for item in rollout_files if item["is_subagent"])
+        backups.append(backup)
+    return sorted(backups, key=lambda item: item["name"], reverse=True)
+
+
+def prune_conversation_backups(codex_home: Path, keep: int = 5) -> dict[str, int]:
+    backups = list_conversation_backups(codex_home)
+    to_delete = backups[keep:]
+    for backup in to_delete:
+        shutil.rmtree(backup["full_path"], ignore_errors=True)
+    return {"deleted": len(to_delete), "remaining": max(0, len(backups) - len(to_delete))}
+
+
+def create_conversation_backup(codex_home: Path) -> dict[str, Any]:
+    source_sessions = codex_home / "sessions"
+    if not source_sessions.exists():
+        return {"created": False, "reason": f"sessions 目录不存在：{source_sessions}"}
+    root = conversation_backup_root(codex_home)
+    backup_dir = unique_timestamp_dir(root)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    copy_directory(source_sessions, backup_dir / "sessions")
+    backup_info = {"sessions_path": backup_dir / "sessions"}
+    rollout_files = list_backup_rollout_files(backup_info)
+    top_level_count = sum(1 for item in rollout_files if not item["is_subagent"])
+    subagent_count = sum(1 for item in rollout_files if item["is_subagent"])
+    prune_result = prune_conversation_backups(codex_home, 5)
+    return {
+        "created": True,
+        "backupDir": backup_dir,
+        "deletedOldBackups": prune_result["deleted"],
+        "remainingBackups": prune_result["remaining"],
+        "topLevelCount": top_level_count,
+        "subagentCount": subagent_count,
+    }
+
+
+def read_rollout_meta(file_path: Path) -> dict[str, Any] | None:
+    first_line, _, _, _ = read_first_line_record(file_path)
+    record = parse_session_meta(first_line)
+    if not record:
+        return None
+    payload = record["payload"]
+    source = payload.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent_thread_id = thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
+    return {
+        "id": payload.get("id") or payload.get("session_id") or file_path.stem.removeprefix("rollout-"),
+        "timestamp": payload.get("timestamp") or record.get("timestamp") or "",
+        "source_path": file_path,
+        "is_subagent": is_subagent_payload(payload),
+        "parent_thread_id": parent_thread_id,
+    }
+
+
+def list_backup_rollout_files(backup: dict[str, Any]) -> list[dict[str, Any]]:
+    result = []
+    for file_path in list_rollout_files(backup["sessions_path"]):
+        try:
+            meta = read_rollout_meta(file_path)
+        except (OSError, json.JSONDecodeError):
+            meta = None
+        if meta:
+            result.append(meta)
+    result.sort(key=lambda item: parse_time_ms(item.get("timestamp")), reverse=True)
+    return result
+
+
+def list_backup_conversation_files(backup: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in list_backup_rollout_files(backup) if not item["is_subagent"]]
+
+
+def target_path_for_backup_rollout(codex_home: Path, backup: dict[str, Any], source_path: Path) -> Path:
+    relative = os.path.relpath(source_path, backup["sessions_path"])
+    if relative.startswith("..") or os.path.isabs(relative):
+        raise RuntimeError(f"备份文件路径异常：{source_path}")
+    return codex_home / "sessions" / relative
+
+
+def rewrite_rollout_provider(file_path: Path, target_provider: str) -> bool:
+    first_line, separator, rest, _ = read_first_line_record(file_path)
+    record = parse_session_meta(first_line)
+    if not record:
+        raise RuntimeError(f"恢复文件缺少有效 session_meta：{file_path}")
+    payload = record["payload"]
+    if payload.get("model_provider") == target_provider:
+        return False
+
+    original_stat = file_path.stat()
+    record["payload"]["model_provider"] = target_provider
+    updated_first_line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    temporary_path = file_path.with_name(
+        f"{file_path.name}.provider-restore.{os.getpid()}.{int(datetime.now().timestamp() * 1000)}.tmp"
+    )
+    try:
+        temporary_path.write_bytes(updated_first_line.encode("utf-8") + separator + rest)
+        os.replace(temporary_path, file_path)
+        os.utime(file_path, (original_stat.st_atime, original_stat.st_mtime))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+    return True
+
+
+def restore_conversation_files(
+    codex_home: Path,
+    backup: dict[str, Any],
+    requested_count: int,
+    target_provider: str | None = None,
+) -> dict[str, Any]:
+    all_rollouts = list_backup_rollout_files(backup)
+    conversations = [item for item in all_rollouts if not item["is_subagent"]]
+    count = len(conversations) if requested_count >= len(conversations) else max(0, requested_count)
+    selected = conversations[:count]
+    selected_ids = {str(item["id"]) for item in selected}
+    internal_selected: list[dict[str, Any]] = []
+    while True:
+        added = False
+        for item in all_rollouts:
+            item_id = str(item["id"])
+            if (
+                item["is_subagent"]
+                and item_id not in selected_ids
+                and item.get("parent_thread_id") in selected_ids
+            ):
+                internal_selected.append(item)
+                selected_ids.add(item_id)
+                added = True
+        if not added:
+            break
+    index_names = read_session_index_names(codex_home)
+    provider_updates = 0
+    for item in selected + internal_selected:
+        target_path = target_path_for_backup_rollout(codex_home, backup, item["source_path"])
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item["source_path"], target_path)
+        if target_provider:
+            provider_updates += int(rewrite_rollout_provider(target_path, target_provider))
+    catalog_result = repair_local_thread_catalog(
+        codex_home,
+        selected_ids,
+        target_provider,
+    )
+    return {
+        "restored": len(selected),
+        "available": len(conversations),
+        "internalRestored": len(internal_selected),
+        "providerUpdated": provider_updates,
+        "catalogInserted": catalog_result["inserted"],
+        "catalogUpdated": catalog_result["updated"],
+        "items": [
+            {
+                "id": item["id"],
+                "name": clean_text((index_names.get(item["id"]) or {}).get("name") or item["id"]),
+            }
+            for item in selected
+        ],
+    }
+
+
+def repair_local_thread_catalog(
+    codex_home: Path,
+    thread_ids: set[str],
+    target_provider: str | None,
+) -> dict[str, int]:
+    """Rebuild the newer Codex sidebar catalog from canonical threads rows."""
+    catalog_path = existing_catalog_db_path(codex_home)
+    state_path = existing_state_db_path(codex_home)
+    if not catalog_path or not state_path or not thread_ids:
+        return {"inserted": 0, "updated": 0}
+
+    with closing(sqlite_connect(state_path, read_only=True)) as source, closing(sqlite_connect(catalog_path)) as catalog:
+        if not table_exists(catalog, "local_thread_catalog"):
+            return {"inserted": 0, "updated": 0}
+        source_columns = table_columns(source, "threads")
+        catalog_columns = table_columns(catalog, "local_thread_catalog")
+        required = {"id", "title", "rollout_path"}
+        if not required.issubset(source_columns) or not {"host_id", "thread_id"}.issubset(catalog_columns):
+            return {"inserted": 0, "updated": 0}
+
+        source_rows = source.execute("SELECT * FROM threads WHERE id IN ({})".format(",".join("?" * len(thread_ids))), tuple(thread_ids)).fetchall()
+        insert_columns = [
+            column for column in (
+                "host_id", "thread_id", "display_title", "source_created_at", "source_updated_at",
+                "cwd", "source_kind", "source_detail", "model_provider", "git_branch",
+                "observation_sequence", "missing_candidate", "thread_source", "source_recency_at",
+                "pending_observed_title", "project_id", "conversation_origin",
+            ) if column in catalog_columns
+        ]
+        if not insert_columns:
+            return {"inserted": 0, "updated": 0}
+        catalog.execute("BEGIN IMMEDIATE")
+        inserted = updated = 0
+        try:
+            max_sequence = catalog.execute(
+                "SELECT COALESCE(MAX(observation_sequence), 0) FROM local_thread_catalog WHERE host_id = 'local'"
+            ).fetchone()[0]
+            for row in source_rows:
+                thread_id = str(row["id"])
+                values = {
+                    "host_id": "local",
+                    "thread_id": thread_id,
+                    "display_title": row["title"] or row["id"],
+                    "source_created_at": (row["created_at_ms"] if "created_at_ms" in source_columns else row["created_at"] * 1000) / 1000,
+                    "source_updated_at": (row["updated_at_ms"] if "updated_at_ms" in source_columns else row["updated_at"] * 1000) / 1000,
+                    "cwd": row["cwd"] if "cwd" in source_columns else "",
+                    "source_kind": row["source"] if "source" in source_columns else "cli",
+                    "source_detail": row["rollout_path"],
+                    "model_provider": target_provider or (row["model_provider"] if "model_provider" in source_columns else DEFAULT_PROVIDER),
+                    "git_branch": row["git_branch"] if "git_branch" in source_columns else None,
+                    "observation_sequence": int(max_sequence) + inserted + 1,
+                    "missing_candidate": 0,
+                    "thread_source": row["thread_source"] if "thread_source" in source_columns else None,
+                    "source_recency_at": (row["updated_at_ms"] if "updated_at_ms" in source_columns else row["updated_at"] * 1000) / 1000,
+                    "pending_observed_title": 0,
+                    "project_id": row["project_id"] if "project_id" in source_columns else None,
+                    "conversation_origin": None,
+                }
+                existing = catalog.execute(
+                    "SELECT 1 FROM local_thread_catalog WHERE host_id = 'local' AND thread_id = ?",
+                    (thread_id,),
+                ).fetchone()
+                if existing:
+                    updates = [column for column in ("display_title", "source_detail", "model_provider", "cwd", "source_updated_at", "source_recency_at") if column in catalog_columns]
+                    catalog.execute(
+                        f"UPDATE local_thread_catalog SET {', '.join(f'{c} = ?' for c in updates)} WHERE host_id = 'local' AND thread_id = ?",
+                        tuple(values[c] for c in updates) + (thread_id,),
+                    )
+                    updated += 1
+                else:
+                    placeholders = ", ".join("?" for _ in insert_columns)
+                    catalog.execute(
+                        f"INSERT OR IGNORE INTO local_thread_catalog ({', '.join(insert_columns)}) VALUES ({placeholders})",
+                        tuple(values[c] for c in insert_columns),
+                    )
+                    inserted += 1
+            if table_exists(catalog, "local_thread_catalog_metadata") and inserted + updated:
+                catalog.execute("UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1")
+            catalog.commit()
+        except Exception:
+            catalog.rollback()
+            raise
+    return {"inserted": inserted, "updated": updated}
+
+
+def delete_conversation_backups(codex_home: Path) -> dict[str, Any]:
+    root = conversation_backup_root(codex_home)
+    backups = list_conversation_backups(codex_home)
+    if backups:
+        shutil.rmtree(root, ignore_errors=True)
+    return {"deleted": len(backups), "root": root}
+
+
+def parse_positive_integer(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not re.match(r"^\d+$", text):
+        return None
+    parsed = int(text, 10)
+    return parsed if parsed > 0 else None
+
+
+def run_restore_flow(codex_home: Path) -> None:
+    _, target_provider, _ = load_operation_provider_config(codex_home)
+    initial_backups = list_conversation_backups(codex_home)
+    print(f"可恢复对话文件备份：{len(initial_backups)} 个")
+    if not initial_backups:
+        print(f"恢复选项不可用：{conversation_backup_root(codex_home)} 下没有包含 sessions/ 的备份。")
+        return
+
+    delete_answer = input("是否删除所有对话文件备份？是请输入Y；不是则请输入任意键：")
+    if delete_answer.strip().upper() == "Y":
+        result = delete_conversation_backups(codex_home)
+        print(f"已删除 {result['deleted']} 个对话文件备份：{result['root']}")
+
+    backups = list_conversation_backups(codex_home)
+    if not backups:
+        print("没有可用于恢复的对话文件备份。")
+        return
+
+    target_backup = backups[0]
+    latest_answer = input("在备份中选择最新的备份进行恢复吗？是：Y，不是：N：")
+    if latest_answer.strip().upper() != "Y":
+        print("所有可恢复备份：")
+        for index, backup in enumerate(backups, start=1):
+            print(
+                f"  {index}. {backup['name']}（{backup['count']} 条顶层对话，"
+                f"另含 {backup['subagent_count']} 条内部子线程）"
+            )
+        while True:
+            index_answer = input("以第几个为恢复目标：")
+            backup_index = parse_positive_integer(index_answer)
+            if backup_index and backup_index <= len(backups):
+                target_backup = backups[backup_index - 1]
+                break
+            print(f"请输入 1 到 {len(backups)} 之间的编号。")
+
+    backup_files = list_backup_conversation_files(target_backup)
+    while True:
+        count_answer = input(
+            f"想要恢复的对话数（该备份共有 {len(backup_files)} 条顶层对话，"
+            f"另含 {target_backup['subagent_count']} 条内部子线程）："
+        )
+        requested_count = parse_positive_integer(count_answer)
+        if requested_count is not None:
+            break
+        print("请输入正整数。")
+
+    actual_count = len(backup_files) if requested_count >= len(backup_files) else requested_count
+    print(f"将从备份 {target_backup['name']} 恢复最近 {actual_count} 条对话。")
+    confirm = input("确认恢复吗？Y：确认；N：退出：")
+    if confirm.strip().upper() != "Y":
+        print("已退出，未恢复任何内容。")
+        return
+
+    result = restore_conversation_files(codex_home, target_backup, requested_count, target_provider)
+    print(f"恢复完成：{result['restored']}/{result['available']} 条。")
+    print(f"随父对话恢复内部子线程：{result['internalRestored']} 条。")
+    print(f"已统一恢复文件的 provider：{result['providerUpdated']} 个。")
+    print(f"已同步新版侧边栏目录：新增 {result['catalogInserted']} 条，更新 {result['catalogUpdated']} 条。")
+    if result["items"]:
+        print("恢复 ID 列表：")
+        for index, item in enumerate(result["items"], start=1):
+            id_label = pad_display(f"{index}. ID：{item['id']}", 50)
+            print(f"  {id_label}Desktop 命名：{shorten(item['name'], 50)}")
+
+
+def backup_sqlite_files(codex_home: Path, db_path: Path) -> Path:
+    backup_dir = codex_home / "backups_state" / "provider-sync-local-backfill" / timestamp_for_path()
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for source_path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if source_path.exists():
+            shutil.copy2(source_path, backup_dir / source_path.name)
+    return backup_dir
+
+
+def build_insert_row(conversation: dict[str, Any], fallback_provider: str) -> dict[str, Any]:
+    title = clean_text(conversation.get("name") or conversation.get("id"))
+    source = conversation.get("source")
+    if not isinstance(source, str) or not source.strip():
+        source = "vscode"
+    thread_source = conversation.get("thread_source")
+    if not isinstance(thread_source, str) or not thread_source.strip():
+        thread_source = "user"
+    created_at = to_unix_seconds(conversation.get("timestamp"))
+    created_at_ms = to_unix_ms(conversation.get("timestamp"))
+    index_updated_ms = parse_time_ms(conversation.get("index_updated_at"))
+    updated_at_ms = index_updated_ms if index_updated_ms else created_at_ms
+    updated_at = int(updated_at_ms / 1000)
+    return {
+        "id": conversation["id"],
+        "rollout_path": str(conversation["file_path"]),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "source": source,
+        # A backfilled row must match the provider that config.toml currently exposes.
+        "model_provider": fallback_provider,
+        "cwd": conversation.get("cwd") or "",
+        "title": title,
+        "sandbox_policy": '{"type":"disabled"}',
+        "approval_mode": "never",
+        "tokens_used": 0,
+        "has_user_event": 1 if conversation.get("has_user_event") else 0,
+        "archived": 0,
+        "archived_at": None,
+        "git_sha": None,
+        "git_branch": None,
+        "git_origin_url": None,
+        "cli_version": conversation.get("cli_version") or "",
+        "first_user_message": title,
+        "agent_nickname": None,
+        "agent_role": None,
+        "memory_mode": "enabled",
+        "model": None,
+        "reasoning_effort": None,
+        "agent_path": None,
+        "created_at_ms": created_at_ms,
+        "updated_at_ms": updated_at_ms,
+        "thread_source": thread_source,
+        "preview": title,
+    }
+
+
+def backfill_missing_threads(codex_home: Path) -> dict[str, Any]:
+    config_text, target_provider, _ = load_operation_provider_config(codex_home)
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        raise RuntimeError("找不到 state_5.sqlite，无法入库。")
+    conversations = build_conversation_details(codex_home)
+    missing_by_id: dict[str, dict[str, Any]] = {}
+    for conversation in conversations:
+        if not conversation["in_sqlite"]:
+            missing_by_id.setdefault(str(conversation["id"]), conversation)
+    missing = list(missing_by_id.values())
+    backup_dir = backup_sqlite_files(codex_home, db_path)
+    if not missing:
+        return {"inserted": 0, "skipped": 0, "backupDir": backup_dir, "ids": [], "skippedIds": []}
+
+    with closing(sqlite_connect(db_path)) as conn:
+        columns = table_columns(conn, "threads")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # The status screen is only a snapshot. Re-check after taking the
+            # write lock so a concurrent update cannot cause a duplicate-ID
+            # failure, and so stale state from an earlier scan is harmless.
+            existing_ids = {str(row["id"]) for row in conn.execute("SELECT id FROM threads")}
+            skipped_ids = sorted(
+                str(conversation["id"])
+                for conversation in missing
+                if str(conversation["id"]) in existing_ids
+            )
+            pending = [
+                conversation
+                for conversation in missing
+                if str(conversation["id"]) not in existing_ids
+            ]
+            inserted_ids: list[str] = []
+            for conversation in pending:
+                row = {
+                    key: value
+                    for key, value in build_insert_row(conversation, target_provider).items()
+                    if key in columns
+                }
+                names = list(row.keys())
+                placeholders = ", ".join(f":{name}" for name in names)
+                conn.execute(
+                    f"INSERT INTO threads ({', '.join(names)}) VALUES ({placeholders})",
+                    row,
+                )
+                inserted_ids.append(str(conversation["id"]))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    return {
+        "inserted": len(inserted_ids),
+        "skipped": len(skipped_ids),
+        "backupDir": backup_dir,
+        "ids": inserted_ids,
+        "skippedIds": skipped_ids,
+    }
+
+
+def backfill(codex_home: Path) -> None:
+    result = backfill_missing_threads(codex_home)
+    print("入库完成。")
+    print(f"本次备份：{result['backupDir']}")
+    print(f"新增 SQLite threads：{result['inserted']} 条")
+    if result["ids"]:
+        print(f"新增 ID：{'，'.join(result['ids'])}")
+    if result.get("skippedIds"):
+        print(f"已跳过数据库中已经存在的重复 ID：{'，'.join(result['skippedIds'])}")
+
+
+def create_sqlite_cleanup_backup(
+    codex_home: Path,
+    db_path: Path,
+    source_conn: sqlite3.Connection,
+    stale_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    backup_dir = unique_timestamp_dir(database_cleanup_backup_root(codex_home))
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    backup_path = backup_dir / db_path.name
+    manifest_path = backup_dir / "deleted_threads.json"
+
+    with closing(sqlite3.connect(backup_path)) as backup_conn:
+        source_conn.backup(backup_conn)
+        backup_integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if backup_integrity != "ok":
+        raise RuntimeError(f"SQLite 清理备份完整性检查失败：{backup_integrity}")
+
+    manifest = {
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "database": str(db_path),
+        "backup_database": str(backup_path),
+        "reason": "threads.rollout_path does not point to an existing file",
+        "rows": stale_rows,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return {
+        "backupDir": backup_dir,
+        "backupDatabase": backup_path,
+        "manifest": manifest_path,
+    }
+
+
+def cleanup_stale_sqlite_threads(
+    codex_home: Path,
+    expected_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        raise RuntimeError("找不到 state_5.sqlite，无法清理。")
+
+    with closing(sqlite_connect(db_path)) as conn:
+        stale_rows = stale_sqlite_thread_rows(conn)
+        stale_ids = {str(row["id"]) for row in stale_rows}
+        if expected_ids is not None and stale_ids != expected_ids:
+            raise RuntimeError("待清理记录在确认后发生变化，已停止操作，请重新检查。")
+        if not stale_rows:
+            return {
+                "deletedThreads": 0,
+                "deletedDynamicTools": 0,
+                "deletedSpawnEdges": 0,
+                "clearedJobAssignments": 0,
+                "backupDir": None,
+                "ids": [],
+            }
+
+        backup = create_sqlite_cleanup_backup(codex_home, db_path, conn, stale_rows)
+        ids = sorted(stale_ids)
+        placeholders = ", ".join("?" for _ in ids)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_ids = {str(row["id"]) for row in stale_sqlite_thread_rows(conn)}
+            if current_ids != stale_ids:
+                raise RuntimeError("待清理记录在事务开始前发生变化，已回滚，请重新检查。")
+
+            deleted_dynamic_tools = 0
+            if table_exists(conn, "thread_dynamic_tools"):
+                deleted_dynamic_tools = conn.execute(
+                    f"DELETE FROM thread_dynamic_tools WHERE thread_id IN ({placeholders})",
+                    ids,
+                ).rowcount
+
+            deleted_spawn_edges = 0
+            if table_exists(conn, "thread_spawn_edges"):
+                deleted_spawn_edges = conn.execute(
+                    f"DELETE FROM thread_spawn_edges "
+                    f"WHERE parent_thread_id IN ({placeholders}) OR child_thread_id IN ({placeholders})",
+                    ids + ids,
+                ).rowcount
+
+            cleared_job_assignments = 0
+            if table_exists(conn, "agent_job_items") and "assigned_thread_id" in table_columns(conn, "agent_job_items"):
+                cleared_job_assignments = conn.execute(
+                    f"UPDATE agent_job_items SET assigned_thread_id = NULL "
+                    f"WHERE assigned_thread_id IN ({placeholders})",
+                    ids,
+                ).rowcount
+
+            deleted_threads = conn.execute(
+                f"DELETE FROM threads WHERE id IN ({placeholders})",
+                ids,
+            ).rowcount
+            if deleted_threads != len(ids):
+                raise RuntimeError(f"预计删除 {len(ids)} 条，实际删除 {deleted_threads} 条，已回滚。")
+
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if integrity != "ok" or foreign_key_errors:
+                raise RuntimeError(
+                    f"清理后数据库校验失败：integrity={integrity}，foreign_keys={len(foreign_key_errors)}，已回滚。"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        return {
+            "deletedThreads": deleted_threads,
+            "deletedDynamicTools": deleted_dynamic_tools,
+            "deletedSpawnEdges": deleted_spawn_edges,
+            "clearedJobAssignments": cleared_job_assignments,
+            "backupDir": backup["backupDir"],
+            "ids": ids,
+        }
+
+
+def cleanup(codex_home: Path) -> None:
+    stale_rows = read_stale_sqlite_threads(codex_home)
+    if not stale_rows:
+        print("没有发现无对应对话文件的数据库异常记录，无需清理。")
+        return
+
+    print(f"发现 {len(stale_rows)} 条无对应对话文件的数据库异常记录：")
+    for index, row in enumerate(stale_rows, start=1):
+        id_label = pad_display(f"{index}. ID：{row['id']}", 50)
+        title_label = pad_display(f"标题：{shorten(row.get('title') or '未命名', 34)}", 48)
+        print(f"  {id_label}{title_label}路径：{shorten(row.get('rollout_path') or '空', 68)}")
+    print()
+    confirm = input("将先完整备份 SQLite，再删除以上记录。输入 Y 确认；其它键取消：")
+    if confirm.strip().upper() != "Y":
+        print("已取消，未修改数据库。")
+        return
+
+    expected_ids = {str(row["id"]) for row in stale_rows}
+    result = cleanup_stale_sqlite_threads(codex_home, expected_ids)
+    print("异常数据清理完成。")
+    print(f"本次备份：{result['backupDir']}")
+    print(f"删除 SQLite threads：{result['deletedThreads']} 条")
+    print(f"删除动态工具关联：{result['deletedDynamicTools']} 条")
+    print(f"删除子线程关联：{result['deletedSpawnEdges']} 条")
+    print(f"清空任务线程引用：{result['clearedJobAssignments']} 条")
+    if result["ids"]:
+        print(f"删除 ID：{'，'.join(result['ids'])}")
+
+
+def copy_provider_sync_backup(codex_home: Path, target_provider: str, changes: list[dict[str, Any]]) -> Path:
+    backup_dir = unique_timestamp_dir(provider_backup_root(codex_home))
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    config_path = codex_home / "config.toml"
+    if config_path.exists():
+        shutil.copy2(config_path, backup_dir / "config.toml")
+    for source_path in provider_database_paths(codex_home):
+        destination = backup_dir / source_path.relative_to(codex_home)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite_connect(source_path, read_only=True)) as source:
+            with closing(sqlite3.connect(destination)) as target:
+                source.backup(target)
+    session_manifest = []
+    for change in changes:
+        source_path = change["path"]
+        relative = os.path.relpath(source_path, codex_home)
+        target_path = backup_dir / relative
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        session_manifest.append({
+            "path": str(source_path),
+            "backupPath": str(target_path),
+            "threadId": change.get("thread_id"),
+            "originalProvider": change.get("original_provider"),
+        })
+    (backup_dir / "manifest.json").write_text(
+        json.dumps({
+            "createdAt": datetime.now(tz=timezone.utc).isoformat(),
+            "targetProvider": target_provider,
+            "changedSessionFiles": session_manifest,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return backup_dir
+
+
+def prune_provider_backups(codex_home: Path, keep: int = 5) -> dict[str, int]:
+    root = provider_backup_root(codex_home)
+    if not root.exists():
+        return {"deletedCount": 0, "remaining": 0}
+    backups = sorted([entry for entry in root.iterdir() if entry.is_dir()], key=lambda item: item.name, reverse=True)
+    to_delete = backups[keep:]
+    for entry in to_delete:
+        shutil.rmtree(entry, ignore_errors=True)
+    return {"deletedCount": len(to_delete), "remaining": max(0, len(backups) - len(to_delete))}
+
+
+def rewrite_rollout_first_line(change: dict[str, Any]) -> bool:
+    file_path: Path = change["path"]
+    try:
+        first_line, separator, rest, _ = read_first_line_record(file_path)
+    except OSError:
+        return False
+    if first_line != change["original_first_line"]:
+        return False
+    tmp_path = file_path.with_name(f"{file_path.name}.provider-sync.{os.getpid()}.{int(datetime.now().timestamp() * 1000)}.tmp")
+    try:
+        tmp_path.write_bytes(change["updated_first_line"].encode("utf-8") + separator + rest)
+        os.replace(tmp_path, file_path)
+        os.utime(file_path, (file_path.stat().st_atime, change["mtime"]))
+        return True
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def restore_rollout_first_lines(changes: list[dict[str, Any]]) -> None:
+    for change in changes:
+        file_path: Path = change["path"]
+        try:
+            file_path.write_bytes(change["original_data"])
+            os.utime(file_path, (file_path.stat().st_atime, change["mtime"]))
+        except OSError:
+            pass
+
+
+def read_thread_cwd_stats(codex_home: Path) -> list[dict[str, Any]]:
+    db_path = existing_state_db_path(codex_home)
+    if not db_path:
+        return []
+    with closing(sqlite_connect(db_path, read_only=True)) as conn:
+        columns = table_columns(conn, "threads")
+        if "cwd" not in columns:
+            return []
+        if "updated_at_ms" in columns and "updated_at" in columns:
+            updated_expr = "COALESCE(MAX(updated_at_ms), MAX(updated_at) * 1000, 0)"
+        elif "updated_at_ms" in columns:
+            updated_expr = "COALESCE(MAX(updated_at_ms), 0)"
+        elif "updated_at" in columns:
+            updated_expr = "COALESCE(MAX(updated_at) * 1000, 0)"
+        else:
+            updated_expr = "0"
+        rows = conn.execute(f"""
+            SELECT cwd, COUNT(*) AS count, {updated_expr} AS updated_at_ms
+            FROM threads
+            WHERE cwd IS NOT NULL AND cwd <> ''
+            GROUP BY cwd
+            ORDER BY count DESC, updated_at_ms DESC, cwd
+        """).fetchall()
+    result = []
+    for row in rows:
+        normalized = normalize_comparable_path(row["cwd"])
+        if normalized:
+            result.append({
+                "cwd": row["cwd"],
+                "normalizedCwd": normalized,
+                "count": int(row["count"] or 0),
+                "updatedAtMs": int(row["updated_at_ms"] or 0),
+            })
+    return result
+
+
+def resolve_stored_path(value: Any, cwd_stats: list[dict[str, Any]]) -> Any:
+    comparable = normalize_comparable_path(value)
+    if not comparable:
+        return value
+    matches = [entry for entry in cwd_stats if entry["normalizedCwd"] == comparable]
+    if not matches:
+        return to_desktop_workspace_path(value)
+    matches.sort(key=lambda entry: (-entry["count"], -entry["updatedAtMs"], entry["cwd"]))
+    return to_desktop_workspace_path(matches[0]["cwd"])
+
+
+def copy_resolved_object_keys(value: Any, cwd_stats: list[dict[str, Any]]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, nested_value in value.items():
+        resolved = resolve_stored_path(key, cwd_stats)
+        if resolved not in result or resolved == key:
+            result[resolved] = nested_value
+    return result
+
+
+def count_array_changes(previous: list[str], next_values: list[str]) -> int:
+    compared = max(len(previous), len(next_values))
+    return sum(1 for index in range(compared) if (previous[index] if index < len(previous) else None) != (next_values[index] if index < len(next_values) else None))
+
+
+def sync_workspace_roots(codex_home: Path) -> dict[str, Any]:
+    file_path = codex_home / ".codex-global-state.json"
+    backup_path = codex_home / ".codex-global-state.json.bak"
+    if not file_path.exists():
+        return {"present": False, "updated": False, "updatedWorkspaceRoots": 0, "savedWorkspaceRootCount": 0}
+
+    original_text = file_path.read_text(encoding="utf-8")
+    state = json.loads(original_text)
+    cwd_stats = read_thread_cwd_stats(codex_home)
+    existing_saved_roots = to_path_array(state.get("electron-saved-workspace-roots"))
+    existing_project_order = to_path_array(state.get("project-order"))
+    existing_active_roots = to_path_array(state.get("active-workspace-roots"))
+
+    source_roots = [*existing_project_order, *existing_saved_roots, *existing_active_roots] if existing_project_order else [*existing_saved_roots, *existing_active_roots]
+    next_saved_roots = dedupe_paths([resolve_stored_path(value, cwd_stats) for value in source_roots])
+    project_source = [*existing_project_order, *existing_saved_roots] if existing_project_order else [*next_saved_roots]
+    next_project_order = dedupe_paths([resolve_stored_path(value, cwd_stats) for value in project_source])
+    next_active_roots = dedupe_paths([resolve_stored_path(value, cwd_stats) for value in existing_active_roots])
+    next_labels = copy_resolved_object_keys(state.get("electron-workspace-root-labels"), cwd_stats)
+    next_open_targets = state.get("open-in-target-preferences")
+    if isinstance(next_open_targets, dict):
+        next_open_targets = dict(next_open_targets)
+        next_open_targets["perPath"] = copy_resolved_object_keys(next_open_targets.get("perPath"), cwd_stats)
+
+    original_active_value = state.get("active-workspace-roots")
+    next_active_value = next_active_roots if isinstance(original_active_value, list) else (next_active_roots[0] if next_active_roots else original_active_value)
+
+    state["electron-saved-workspace-roots"] = next_saved_roots
+    state["project-order"] = next_project_order
+    state["active-workspace-roots"] = next_active_value
+    if next_labels is not None:
+        state["electron-workspace-root-labels"] = next_labels
+    if next_open_targets is not None:
+        state["open-in-target-preferences"] = next_open_targets
+
+    next_text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    updated = original_text != next_text or not backup_path.exists()
+    if updated:
+        file_path.write_text(next_text, encoding="utf-8")
+        backup_path.write_text(next_text, encoding="utf-8")
+    return {
+        "present": True,
+        "updated": updated,
+        "updatedWorkspaceRoots": count_array_changes(existing_saved_roots, next_saved_roots),
+        "savedWorkspaceRootCount": len(next_saved_roots),
+    }
+
+
+def provider_database_paths(codex_home: Path) -> list[Path]:
+    paths = [entry["path"] for entry in state_db_candidates(codex_home) if entry["path"].exists()]
+    catalog = existing_catalog_db_path(codex_home)
+    if catalog:
+        paths.append(catalog)
+    return paths
+
+
+def update_sqlite_provider(
+    codex_home: Path,
+    target_provider: str,
+    user_event_thread_ids: set[str],
+    thread_cwd_by_id: dict[str, str],
+    after_update,
+) -> dict[str, Any]:
+    paths = provider_database_paths(codex_home)
+    provider_rows = user_event_rows = cwd_rows = catalog_rows = 0
+    with ExitStack() as stack:
+        connections = [stack.enter_context(closing(sqlite_connect(path))) for path in paths]
+        try:
+            # Lock every database before applying changes, including both state layouts.
+            for conn in connections:
+                conn.execute("BEGIN IMMEDIATE")
+            for conn in connections:
+                columns = table_columns(conn, "threads")
+                if "model_provider" in columns:
+                    provider_rows += conn.execute(
+                        "UPDATE threads SET model_provider = ? WHERE COALESCE(model_provider, '') <> ?",
+                        (target_provider, target_provider),
+                    ).rowcount
+                if {"id", "has_user_event"}.issubset(columns):
+                    for thread_id in user_event_thread_ids:
+                        user_event_rows += conn.execute(
+                            "UPDATE threads SET has_user_event = 1 WHERE id = ? AND COALESCE(has_user_event, 0) <> 1",
+                            (thread_id,),
+                        ).rowcount
+                if {"id", "cwd"}.issubset(columns):
+                    for thread_id, cwd in thread_cwd_by_id.items():
+                        if thread_id and cwd.strip():
+                            cwd_rows += conn.execute(
+                                "UPDATE threads SET cwd = ? WHERE id = ? AND COALESCE(cwd, '') <> ?",
+                                (cwd, thread_id, cwd),
+                            ).rowcount
+                catalog_columns = table_columns(conn, "local_thread_catalog")
+                if {"host_id", "model_provider"}.issubset(catalog_columns):
+                    changed = conn.execute(
+                        "UPDATE local_thread_catalog SET model_provider = ? "
+                        "WHERE host_id = 'local' AND COALESCE(model_provider, '') <> ?",
+                        (target_provider, target_provider),
+                    ).rowcount
+                    catalog_rows += changed
+                    if changed and "catalog_revision" in table_columns(conn, "local_thread_catalog_metadata"):
+                        conn.execute("UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id = 1")
+                if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise RuntimeError("SQLite 完整性校验失败，已停止同步。")
+            after_update()
+            for conn in connections:
+                conn.commit()
+        except Exception:
+            for conn in connections:
+                conn.rollback()
+            # Separate database commits are not crash-atomic; full snapshots are retained.
+            raise
+    return {
+        "updatedRows": provider_rows + user_event_rows + cwd_rows + catalog_rows,
+        "providerRowsUpdated": provider_rows,
+        "userEventRowsUpdated": user_event_rows,
+        "cwdRowsUpdated": cwd_rows,
+        "catalogRowsUpdated": catalog_rows,
+        "databasePresent": bool(paths),
+    }
+
+
+def verify_provider_sync(codex_home: Path, target_provider: str) -> None:
+    for path in provider_database_paths(codex_home):
+        with closing(sqlite_connect(path, read_only=True)) as conn:
+            for table, condition in (("threads", "1=1"), ("local_thread_catalog", "host_id = 'local'")):
+                if "model_provider" in table_columns(conn, table):
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {condition} AND COALESCE(model_provider, '') <> ?",
+                        (target_provider,),
+                    ).fetchone()[0]
+                    if count:
+                        raise RuntimeError(f"同步校验失败：{path.name}/{table} 仍有 {count} 条 provider 不一致。")
+    for directory in SESSION_DIRS:
+        for path in list_rollout_files(codex_home / directory):
+            with path.open(encoding="utf-8") as handle:
+                record = parse_session_meta(handle.readline())
+            if record and record["payload"].get("model_provider") != target_provider:
+                raise RuntimeError(f"同步校验失败：{path} provider 不一致。")
+
+
+def sync(codex_home: Path) -> None:
+    config_text, target_provider, _ = load_operation_provider_config(codex_home)
+    rollout = collect_rollout_status(codex_home, target_provider)
+    changes = rollout["changes"]
+    if rollout["locked_paths"]:
+        raise RuntimeError("部分会话文件无法读取，已停止同步，请关闭应用后重试。")
+
+    print("正在扫描对话文件...")
+    print("正在创建备份...")
+    backup_dir = copy_provider_sync_backup(codex_home, target_provider, changes)
+    validate_config_snapshot(codex_home, config_text, target_provider)
+
+    applied_changes: list[dict[str, Any]] = []
+    workspace_result = {"updatedWorkspaceRoots": 0, "savedWorkspaceRootCount": 0}
+
+    def apply_files_and_workspace() -> None:
+        nonlocal applied_changes, workspace_result
+        print("正在更新对话文件...")
+        for change in changes:
+            if rewrite_rollout_first_line(change):
+                applied_changes.append(change)
+            else:
+                raise RuntimeError(f"会话文件发生变化或无法写入：{change['path']}")
+        workspace_result = sync_workspace_roots(codex_home)
+
+    try:
+        print("正在更新 SQLite...")
+        validate_config_snapshot(codex_home, config_text, target_provider)
+        sqlite_result = update_sqlite_provider(
+            codex_home,
+            target_provider,
+            rollout["user_event_thread_ids"],
+            rollout["thread_cwd_by_id"],
+            apply_files_and_workspace,
+        )
+    except Exception:
+        restore_rollout_first_lines(applied_changes)
+        raise
+
+    validate_config_snapshot(codex_home, config_text, target_provider)
+    verify_provider_sync(codex_home, target_provider)
+    # Keep snapshots; provider migration must not delete older recovery points.
+
+    print("保存完成。")
+    print(f"目标 provider：{target_provider}")
+    print(f"本次备份：{backup_dir}")
+    print(f"已更新对话文件：{len(applied_changes)} 个")
+    print(f"已更新 SQLite provider 行：{sqlite_result['providerRowsUpdated']} 行")
+    print(f"已更新本机目录索引 provider：{sqlite_result['catalogRowsUpdated']} 行")
+    print("provider 一致性校验通过。")
+    print(f"已修复 user-event：{sqlite_result['userEventRowsUpdated']} 行")
+    print(f"已修复 cwd 路径：{sqlite_result['cwdRowsUpdated']} 行")
+    print(f"已更新项目路径缓存：{workspace_result.get('updatedWorkspaceRoots') or 0} 个")
+
+
+def interactive(codex_home: Path) -> None:
+    # Deletion remains available even when provider configuration is invalid.
+    try:
+        print_status(codex_home)
+    except Exception as error:
+        print(f"状态读取失败（仍可输入 A 按链接删除）：{error}")
+    print()
+    print("选择：")
+    mode = input("输入 S：同步当前 provider；输入 A：按深度链接删除指定对话；其它键：备份恢复菜单：")
+    if mode.strip().upper() == "A":
+        from codex_delete_conversation import interactive_delete
+        interactive_delete(codex_home)
+        return
+    if mode.strip().upper() == "S":
+        sync(codex_home)
+        return
+    backup_answer = input("是否进行对话恢复备份？Y：备份；其它键跳过：")
+    if backup_answer.strip().upper() == "Y":
+        backup_result = create_conversation_backup(codex_home)
+        if backup_result.get("created"):
+            print(f"对话恢复备份完成：{backup_result['backupDir']}")
+            print(
+                f"本次备份：{backup_result['topLevelCount']} 条顶层对话，"
+                f"另含 {backup_result['subagentCount']} 条内部子线程。"
+            )
+            print(f"备份保留：{backup_result['remainingBackups']} 份；本次清理旧备份：{backup_result['deletedOldBackups']} 份")
+        else:
+            print(f"对话恢复备份跳过：{backup_result['reason']}")
+    else:
+        print("已跳过对话恢复备份。")
+    print()
+    first_answer = input("输入 B：将未入库的对话入库；输入 C：清理数据库异常记录；其它键继续：")
+    if first_answer.strip().upper() == "B":
+        backfill(codex_home)
+        sync(codex_home)
+        return
+    if first_answer.strip().upper() == "C":
+        cleanup(codex_home)
+        return
+
+    run_restore_flow(codex_home)
+
+    final_answer = input("输入 Y 进行保存；其它键取消：")
+    if final_answer.strip().upper() == "Y":
+        sync(codex_home)
+    else:
+        print("已取消，未修改任何内容。")
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else "status"
+    codex_home = normalize_codex_home(argv[2] if len(argv) > 2 else None)
+    try:
+        if command == "status":
+            print_status(codex_home)
+        elif command == "sync":
+            sync(codex_home)
+        elif command == "backfill":
+            backfill(codex_home)
+        elif command == "cleanup":
+            cleanup(codex_home)
+        elif command == "interactive":
+            interactive(codex_home)
+        else:
+            raise RuntimeError(f"未知命令：{command}")
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
